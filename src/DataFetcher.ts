@@ -24,6 +24,15 @@ function getDataURLForPath(url: string, isDevelopment: boolean): string {
 
 export type AbortedCallback = () => void;
 
+export interface DataFetcherCacheStats {
+    hits: number;
+    misses: number;
+    writes: number;
+    readErrors: number;
+    writeErrors: number;
+    networkRequests: number;
+}
+
 class DataFetcherRequest {
     public promise: Promise<NamedArrayBufferSlice>;
     public progress: number = 0;
@@ -32,23 +41,29 @@ class DataFetcherRequest {
 
     private started = false;
     private request: Request;
+    private cacheRequest: Request;
+    private isRangeRequest = false;
     private response: Response | null = null;
     private abortController = new AbortController();
     private resolve: (slice: NamedArrayBufferSlice) => void;
     private reject: (e: Error | null) => void;
     private retriesLeft = 2;
 
-    constructor(private cache: Cache | null, public url: string, private options: DataFetcherOptions) {
+    constructor(private cache: Cache | null, private cacheStats: DataFetcherCacheStats, public url: string, private options: DataFetcherOptions) {
         this.request = new Request(this.url, { signal: this.abortController.signal });
+        this.cacheRequest = this.request;
 
         if (this.options.rangeStart !== undefined && this.options.rangeSize !== undefined) {
             const rangeStart = Number(this.options.rangeStart);
             const rangeSize = Number(this.options.rangeSize);
             let rangeEnd = rangeStart + rangeSize - Number(1);
             this.request.headers.set('range', `bytes=${rangeStart}-${rangeEnd}`);
+            this.isRangeRequest = true;
 
-            // Partial responses are unsupported with Cache, for some lovely reason.
-            this.cache = null;
+            const cacheURL = new URL(this.url);
+            cacheURL.searchParams.set('__noclip_range_start', `${rangeStart}`);
+            cacheURL.searchParams.set('__noclip_range_size', `${rangeSize}`);
+            this.cacheRequest = new Request(cacheURL.toString());
         }
 
         this.promise = new Promise((resolve, reject) => {
@@ -115,19 +130,47 @@ class DataFetcherRequest {
     public async start() {
         this.started = true;
 
-        if (this.cache !== null) {
-            const match = await this.cache.match(this.request).catch(error => {
-                console.error("Cache error:", error);
-            });
-
-            if (match !== undefined) {
-                const arrayBuffer = await match.arrayBuffer();
-                this.resolveArrayBuffer(arrayBuffer);
-                return;
+        try {
+            await this.startInner();
+        } catch (e) {
+            console.warn(`DataFetcherRequest failed for ${this.url}:`, e);
+            this.response = null;
+            if (this.retriesLeft > 0) {
+                this.retriesLeft--;
+                void this.start();
+            } else {
+                this.reject(e instanceof Error ? e : new Error(String(e)));
+                this.done();
             }
+        }
+    }
+
+    private async startInner() {
+
+        if (this.cache !== null) {
+            try {
+                const match = await this.cache.match(this.cacheRequest);
+                if (match !== undefined) {
+                    const arrayBuffer = await match.arrayBuffer();
+                    const expectedSize = this.options.rangeSize !== undefined ? Number(this.options.rangeSize) : null;
+                    if (expectedSize === null || arrayBuffer.byteLength === expectedSize) {
+                        this.cacheStats.hits++;
+                        this.resolveArrayBuffer(arrayBuffer);
+                        return;
+                    }
+
+                    await this.cache.delete(this.cacheRequest);
+                }
+            } catch (error) {
+                this.cacheStats.readErrors++;
+                console.warn("Cache read error:", error);
+                await this.cache.delete(this.cacheRequest).catch(() => false);
+            }
+            this.cacheStats.misses++;
         }
 
         assert(this.response === null);
+        this.cacheStats.networkRequests++;
         try {
             this.response = await fetch(this.request);
         } catch (e: unknown) {
@@ -138,11 +181,6 @@ class DataFetcherRequest {
             return;
 
         const response = this.response!;
-
-        if (response.status === 206) {
-            // Partial responses are unsupported with Cache, for some lovely reason.
-            this.cache = null;
-        }
 
         const responseClone = response.clone();
 
@@ -181,15 +219,29 @@ class DataFetcherRequest {
         if (this.resolveError())
             return;
 
-        if (arrayBuffer === null)
+        if (this.isRangeRequest || arrayBuffer === null)
             arrayBuffer = await responseClone.clone().arrayBuffer();
 
-        this.resolveArrayBuffer(arrayBuffer);
-
-        if (this.cache !== null)
-            await this.cache.put(this.request, responseClone);
+        if (this.cache !== null) {
+            try {
+                if (this.isRangeRequest) {
+                    const cachedRangeResponse = new Response(arrayBuffer.slice(0), {
+                        status: 200,
+                        headers: { 'content-type': 'application/octet-stream' },
+                    });
+                    await this.cache.put(this.cacheRequest, cachedRangeResponse);
+                } else {
+                    await this.cache.put(this.cacheRequest, responseClone);
+                }
+                this.cacheStats.writes++;
+            } catch (error) {
+                this.cacheStats.writeErrors++;
+                console.warn("Unable to persist downloaded data:", error);
+            }
+        }
 
         this.response = null;
+        this.resolveArrayBuffer(arrayBuffer);
     }
 
     private done(): void {
@@ -281,6 +333,14 @@ export class DataFetcher {
     public aborted: boolean = false;
     public useDevelopmentStorage: boolean | null = null;
     private cache: Cache | null = null;
+    public cacheStats: DataFetcherCacheStats = {
+        hits: 0,
+        misses: 0,
+        writes: 0,
+        readErrors: 0,
+        writeErrors: 0,
+        networkRequests: 0,
+    };
     private mounts: DataFetcherMount[] = [];
     public debug = IS_DEVELOPMENT;
 
@@ -296,9 +356,12 @@ export class DataFetcher {
             this.useDevelopmentStorage = false;
         }
 
-        const REQUEST_CACHE_NAME = `request-cache-v1`;
+        const REQUEST_CACHE_NAME = `wow-archaeology-cache-v2`;
         try {
             this.cache = await caches.open(REQUEST_CACHE_NAME);
+            const persistenceRequest = navigator.storage?.persist?.();
+            if (persistenceRequest !== undefined)
+                persistenceRequest.catch(() => {});
         } catch(e) {
             // Cache failed to open. That's OK, just don't use it.
         }
@@ -400,7 +463,7 @@ export class DataFetcher {
         if (this.aborted)
             throw new Error("Tried to fetch new data while aborted; should not happen");
 
-        const request = new DataFetcherRequest(this.cache, url, options);
+        const request = new DataFetcherRequest(this.cache, this.cacheStats, url, options);
         this.requests.push(request);
         request.ondone = () => {
             this.doneRequestCount++;

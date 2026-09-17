@@ -55,6 +55,7 @@ import {
     SkinData,
     WmoBatchData,
     WmoData,
+    TerrainDetailLevel,
     getSkyboxDoodad,
 } from "./data.js";
 import {
@@ -749,10 +750,17 @@ export class WmoRenderer {
 export class TerrainRenderer {
     private inputLayout: GfxInputLayout;
     public indexBuffer: GfxIndexBufferDescriptor;
+    public lowDetailIndexBuffer: GfxIndexBufferDescriptor;
+    public ultraDetailIndexBuffer: GfxIndexBufferDescriptor;
+    public extremeDetailIndexBuffer: GfxIndexBufferDescriptor;
     public vertexBuffer: GfxVertexBufferDescriptor;
     public alphaTextureMappings: (TextureMapping | null)[] = [];
     public shadowTextureMappings: (TextureMapping | null)[] = [];
     public chunkTextureMappings: TextureMappingArray[] = [];
+    private reducedChunkTextureMappings: TextureMappingArray[] = [];
+    private reducedTextureMinLOD = -1;
+    private continentalTextureChunkIndex = 0;
+    private continentalIndexCount = 0;
 
     constructor(
         device: GfxDevice,
@@ -806,11 +814,21 @@ export class TerrainRenderer {
             vertexBufferDescriptors,
             indexBufferFormat,
         });
-        [this.vertexBuffer, this.indexBuffer] =
+        [this.vertexBuffer, this.indexBuffer, this.lowDetailIndexBuffer, this.ultraDetailIndexBuffer, this.extremeDetailIndexBuffer] =
             this.adt.getBuffers(device);
+        const baseTextureUseCount = new Map<number, { count: number, chunkIndex: number }>();
         for (let i in this.adt.chunkData) {
             const chunk = this.adt.chunkData[i];
             this.chunkTextureMappings[i] = this.getChunkTextureMapping(chunk);
+            this.continentalIndexCount += chunk.extremeDetailIndexCount;
+            const baseTextureId = chunk.textures[0]?.fileId;
+            if (baseTextureId !== undefined) {
+                const previous = baseTextureUseCount.get(baseTextureId);
+                if (previous === undefined)
+                    baseTextureUseCount.set(baseTextureId, { count: 1, chunkIndex: Number(i) });
+                else
+                    previous.count++;
+            }
 
             if (chunk.alphaTexture) {
                 const alphaMapping = textureCache.getAlphaTextureMapping(
@@ -840,6 +858,13 @@ export class TerrainRenderer {
                 );
             }
         }
+        let dominantCount = -1;
+        for (const candidate of baseTextureUseCount.values()) {
+            if (candidate.count > dominantCount) {
+                dominantCount = candidate.count;
+                this.continentalTextureChunkIndex = candidate.chunkIndex;
+            }
+        }
     }
 
     private getChunkTextureMapping(chunk: ChunkData): TextureMappingArray {
@@ -857,31 +882,72 @@ export class TerrainRenderer {
         return mapping;
     }
 
+    private getReducedTextureMappings(minLOD: number): TextureMappingArray[] {
+        if (this.reducedTextureMinLOD === minLOD)
+            return this.reducedChunkTextureMappings;
+
+        const reducedSampler = this.textureCache.getSampler({ wrapS: true, wrapT: true }, minLOD);
+        this.reducedChunkTextureMappings = this.chunkTextureMappings.map((sourceMappings) =>
+            sourceMappings.map((source, index) => {
+                if (source === null || index >= 4)
+                    return source;
+                const reduced = new TextureMapping();
+                reduced.copy(source);
+                reduced.gfxSampler = reducedSampler;
+                return reduced;
+            }),
+        );
+        this.reducedTextureMinLOD = minLOD;
+        return this.reducedChunkTextureMappings;
+    }
+
     public prepareToRenderTerrain(
         renderInstManager: GfxRenderInstManager,
         frame: FrameData,
+        reduceDistantTextures: boolean,
+        distantTextureMinLOD: number,
     ) {
         const indices = frame.adtChunkIndices.get(this.adt.fileId);
         if (indices.length === 0) return;
         const template = renderInstManager.pushTemplate();
+        const detailLevel = this.adt.terrainDetailLevel;
+        const indexBuffer = detailLevel === TerrainDetailLevel.High ? this.indexBuffer :
+            detailLevel === TerrainDetailLevel.Low ? this.lowDetailIndexBuffer :
+            detailLevel === TerrainDetailLevel.Ultra ? this.ultraDetailIndexBuffer : this.extremeDetailIndexBuffer;
         template.setVertexInput(
             this.inputLayout,
             [this.vertexBuffer],
-            this.indexBuffer,
+            indexBuffer,
         );
 
         let offs = template.allocateUniformBuffer(TerrainProgram.ub_TerrainParams, 4);
         const d = template.mapUniformBufferF32(TerrainProgram.ub_TerrainParams);
         offs += fillVec4(d, offs, this.adt.hasBigAlpha ? 1.0 : 0.0);
 
+        const textureMappings = reduceDistantTextures && detailLevel !== TerrainDetailLevel.High ?
+            this.getReducedTextureMappings(distantTextureMinLOD) : this.chunkTextureMappings;
+        if (detailLevel === TerrainDetailLevel.Continental) {
+            const renderInst = renderInstManager.newRenderInst();
+            renderInst.setSamplerBindingsFromTextureMappings(textureMappings[this.continentalTextureChunkIndex]);
+            renderInst.setDrawCount(this.continentalIndexCount, 0);
+            renderInstManager.submitRenderInst(renderInst);
+            renderInstManager.popTemplate();
+            return;
+        }
         for (let i of indices) {
             const chunk = this.adt.chunkData[i];
-            if (chunk.indexCount === 0) continue;
+            const indexCount = detailLevel === TerrainDetailLevel.High ? chunk.indexCount :
+                detailLevel === TerrainDetailLevel.Low ? chunk.lowDetailIndexCount :
+                detailLevel === TerrainDetailLevel.Ultra ? chunk.ultraDetailIndexCount : chunk.extremeDetailIndexCount;
+            const indexOffset = detailLevel === TerrainDetailLevel.High ? chunk.indexOffset :
+                detailLevel === TerrainDetailLevel.Low ? chunk.lowDetailIndexOffset :
+                detailLevel === TerrainDetailLevel.Ultra ? chunk.ultraDetailIndexOffset : chunk.extremeDetailIndexOffset;
+            if (indexCount === 0) continue;
             const renderInst = renderInstManager.newRenderInst();
             renderInst.setSamplerBindingsFromTextureMappings(
-                this.chunkTextureMappings[i],
+                textureMappings[i],
             );
-            renderInst.setDrawCount(chunk.indexCount, chunk.indexOffset);
+            renderInst.setDrawCount(indexCount, indexOffset);
             renderInstManager.submitRenderInst(renderInst);
         }
         renderInstManager.popTemplate();
@@ -890,6 +956,9 @@ export class TerrainRenderer {
     public destroy(device: GfxDevice) {
         device.destroyBuffer(this.vertexBuffer.buffer);
         device.destroyBuffer(this.indexBuffer.buffer);
+        device.destroyBuffer(this.lowDetailIndexBuffer.buffer);
+        device.destroyBuffer(this.ultraDetailIndexBuffer.buffer);
+        device.destroyBuffer(this.extremeDetailIndexBuffer.buffer);
         const textureMappings = this.alphaTextureMappings.concat(
             this.shadowTextureMappings,
         );

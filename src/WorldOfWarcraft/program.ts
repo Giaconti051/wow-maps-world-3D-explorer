@@ -817,6 +817,82 @@ void mainPS() {
 `;
 }
 
+// Far-away ADTs are submitted as one draw instead of one draw per chunk. The
+// dominant base texture is repeated across the ADT; local texture layers and
+// alpha maps are intentionally discarded in exchange for drastically fewer
+// draw calls.
+export class ContinentalTerrainProgram extends BaseProgram {
+    public static a_Position = TerrainProgram.a_Position;
+    public static a_Normal = TerrainProgram.a_Normal;
+    public static a_Color = TerrainProgram.a_Color;
+    public static a_ChunkIndex = TerrainProgram.a_ChunkIndex;
+    public static a_Lighting = TerrainProgram.a_Lighting;
+    public static ub_TerrainParams = TerrainProgram.ub_TerrainParams;
+
+    public override both = `
+${BaseProgram.commonDeclarations}
+
+layout(std140) uniform ub_TerrainParams {
+    vec4 u_TerrainParams;
+};
+
+layout(binding = 0) uniform sampler2D u_Texture0;
+
+varying vec3 v_Normal;
+varying vec4 v_Color;
+varying vec4 v_Lighting;
+varying vec3 v_Position;
+varying vec2 v_ChunkCoords;
+
+#ifdef VERT
+layout(location = ${ContinentalTerrainProgram.a_Position}) attribute vec3 a_Position;
+layout(location = ${ContinentalTerrainProgram.a_Normal}) attribute vec3 a_Normal;
+layout(location = ${ContinentalTerrainProgram.a_Color}) attribute vec4 a_Color;
+layout(location = ${ContinentalTerrainProgram.a_Lighting}) attribute vec4 a_Lighting;
+layout(location = ${ContinentalTerrainProgram.a_ChunkIndex}) attribute float a_ChunkIndex;
+
+void mainVS() {
+    float iX = mod(a_ChunkIndex, 17.0);
+    float iY = floor(a_ChunkIndex / 17.0);
+    if (iX > 8.01) {
+        iY += 0.5;
+        iX -= 8.5;
+    }
+    v_ChunkCoords = vec2(iX, iY);
+    v_Color = a_Color;
+    v_Lighting = a_Lighting;
+    v_Normal = a_Normal;
+    vec3 t_PositionView = UnpackMatrix(u_View) * vec4(a_Position, 1.0);
+    gl_Position = UnpackMatrix(u_Projection) * vec4(t_PositionView, 1.0);
+    v_Position = a_Position;
+}
+#endif
+
+#ifdef FRAG
+void mainPS() {
+    vec4 tex = texture(SAMPLER_2D(u_Texture0), v_ChunkCoords);
+    vec3 diffuse = (2.0 * tex * v_Color).rgb;
+    vec3 finalColor = calcLight(
+        diffuse,
+        v_Normal,
+        vec4(0.0),
+        vec4(0.0),
+        1.0,
+        false,
+        true,
+        v_Lighting.rgb,
+        vec3(0.0),
+        vec3(0.0),
+        vec3(0.0),
+        0.0
+    );
+    finalColor = calcFog(finalColor, v_Position, false);
+    gl_FragColor = vec4(finalColor, 1.0);
+}
+#endif
+`;
+}
+
 export const MAX_DOODAD_INSTANCES = 32;
 
 export class ModelProgram extends BaseProgram {

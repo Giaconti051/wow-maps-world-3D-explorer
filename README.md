@@ -1,89 +1,64 @@
-<img align="right" src="src/assets/logo.png">
+# World of Warcraft Maps and World 3D Explorer
 
-# <a href="https://noclip.website">noclip</a>
+A specialized fork of [noclip.website](https://github.com/magcius/noclip.website) for freely exploring World of Warcraft maps, including unfinished and normally inaccessible areas.
 
-The reverse engineering of model formats was done by many people. See the application for full credits.
+The map selector focuses on Vanilla, The Burning Crusade and Wrath of the Lich King. This fork adds configurable terrain detail, streaming controls, persistent caching and resolution scaling for large landscape views.
 
-## Contributing
+## Download and run on Windows
 
-Contributions are very welcome! New games, new features, and bug fixes are all very appreciated. Even small contributions like proper map names, grouping maps and new default savestates are extremely helpful.
+Prebuilt packages are distributed through [Releases](https://github.com/Giaconti051/wow-maps-world-3D-explorer/releases). If no release is listed yet, a prebuilt download has not been published.
 
-## AI Contributions Policy
+1. Download the viewer ZIP attached to a release (not GitHub's automatically generated source archive).
+2. Extract it into a folder on the drive of your choice.
+3. Run `START_WOW_ARCHAEOLOGY.bat` (the launcher retains its original filename).
+4. Microsoft Edge opens the viewer at `http://localhost:4173/`.
+5. Keep the PowerShell window open while using the viewer. Press Ctrl+C there to stop the server.
 
-* If AI was used in any capacity for your contribution (coding, reverse engineering, authoring commit messages or PR descriptions), this must be disclosed in your pull request.
-* Please only submit contributions that you have tested, reviewed, and feel you understand.
-* All comments or documentation *must* be fully human-authored. Any AI-written or even AI-assisted comments are not allowed.
-* Project maintainers reserve the right to reject contributions at any time, for any reason, including if they suspect this policy has not been correctly followed.
+An internet connection is needed to fetch map resources that are not already cached. Game assets are not bundled in this update; resource availability depends on the external data service used by noclip.website.
 
-## Development Guide
+The launcher creates a dedicated Edge profile in `WoW_Archaeology_BrowserData`, next to `start.ps1`. Keep that directory when updating to retain cached downloads and preferences. Its old name is intentional for compatibility. Cached resources still need parsing and GPU upload when loaded again; caching does not make loading instantaneous or guarantee that an entire map is available offline.
 
-To develop for noclip.website, you'll need these requisites:
+## Features
 
-* Your code editor of choice (for example, [Visual Studio Code](https://code.visualstudio.com/), [WebStorm](https://www.jetbrains.com/webstorm/)),
-* [Node.js](https://nodejs.org/en/download). Choose the latest LTS version and choose the `pnpm` package manager,
-* [rustup](https://rust-lang.org/learn/get-started/).
+- WoW-only map selection and optional atmospheric fog.
+- Adjustable view distance and resident tile radius.
+- Terrain-first streaming, with M2/WMO objects requested within the object radius.
+- High, Low, Ultra and Extreme terrain geometry detail.
+- Continental terrain mode: one terrain draw call per distant ADT, using the Extreme index buffer and the tile's dominant base texture. Local texture layers and terrain shadow maps are sacrificed for lower rendering overhead.
+- Optional distant texture mip reduction.
+- Render scale from 33% to 100%, with Bilinear, Sharp and Edge-adaptive filters. These are custom spatial filters, not NVIDIA DLSS or the official AMD FSR implementation.
+- Saved viewer settings and loading/cache diagnostics.
 
-Then, use the following commands to set up your environment (only needed every so often):
-* Install dependencies from npm: `pnpm install`,
-* Set up the required rust binaries:
-  ```shell
-  rustup target add wasm32-unknown-unknown
-  cd rust
-  cargo install cargo-run-bin
-  cargo bin --install
-  ```
-
-Finally, to build and run the project, use `pnpm start`. This will start a live-reloading environment and uses filesystem watchers to auto-build the project. To include live-reloading for Rust code as well, use `pnpm start --watch`.
-
-Note that Rust will be built in debug mode by default, which can greatly affect performance. To build the project with Rust in release mode, use `pnpm start:release` instead.
-
-For any questions related to development, see the [Official noclip.website Discord Server](https://discord.gg/bkJmKKv)'s #development channel. A number of developers from the community are present there and can help answer questions if you run into any additional issues getting set up.
+Performance gains depend on the scene, hardware and selected settings. The lower-detail modes intentionally trade visual accuracy for speed.
 
 ## Controls
 
-Key | Description
--|-
-`Z` | Show/hide all UI
-`T` | Open "Games" list
-`W`/`A`/`S`/`D` or Arrow Keys | Move camera
-Hold `Shift` | Make camera move faster
-Hold `\` | Make camera move slower
-`E` or `Page Up` or `Space` | Move camera up
-`Q` or `Page Down` or `Ctrl+Space` | Move camera down
-`Scroll Wheel` | Adjust camera movement speed (in WASD camera mode; instead changes the zoom level in Orbit or Ortho camera modes)
-`I`/`J`/`K`/`L` | Tilt camera
-`O` | Rotate camera clockwise
-`U` | Rotate camera counterclockwise
-`X` | in WASD camera mode; enables "Hover Mode", locking changes to the y axis to the "Move camera up/down" controls
-`1`/`2`/`3`/`4`/`5`/`6`/`7`/`8`/`9` | Load savestate
-`Shift`+`1`/`2`/`3`/`4`/`5`/`6`/`7`/`8`/`9` | Save savestate
-`Numpad 3` | Export save states
-`.` | Freeze/unfreeze time
-`,` | Hold to slowly move through time
-`F9` | Reload current scene
-`B` | Reset camera position back to origin
-`R` | Start/stop automatic orbiting (requries Orbit or Ortho camera modes)
-`Numpad 5` | Immediately stop all orbiting (requries Orbit or Ortho camera modes)
-`Numpad 2`/`Numpad 4`/`Numpad 6`/`Numpad 8` | Snap view to front/left/right/top view (requires Orbit camera mode)
-`F` | Not sure what this key does, let me know if you figure it out
+Drag the mouse to look around, use WASD to move, hold Shift to move faster and use the mouse wheel to adjust speed. Press Z to show or hide the interface. Open **World Explorer Settings** for this fork's rendering and streaming controls.
 
-## Third-Party Credits
+See [the Italian guide](public/README_ITA.txt) for detailed settings and [the upstream documentation](README_UPSTREAM.md) for additional controls.
 
-All icons you see are from [The Noun Project](https://thenounproject.com/), used under Creative Commons CC-BY:
-* Truncated Pyramid by Bohdan Burmich
-* Images by Creative Stall
-* Help by Gregor Cresnar
-* Open by Landan Lloyd
-* Nightshift by mikicon
-* Layer by Chameleon Design
-* Sand Clock by James
-* Line Chart by Shastry
-* Search by Alain W.
-* Save by Prime Icons
-* Overlap by Zach Bogart
-* VR by Fauzan Adaiima
-* Play Clapboard by Yoyon Pujiyono
-* Undo by Numero Uno
-* Redo by Numero Uno
-* Zoom In by Tanvir Islam
-* Zoom Out by Tanvir Islam
+## Build from source
+
+The source repository is not a ready-to-run Windows package. You need Node.js, pnpm and Rust installed through rustup, as described in the upstream guide.
+
+From the repository root:
+
+```sh
+pnpm install
+rustup target add wasm32-unknown-unknown
+cd rust
+cargo install cargo-run-bin
+cargo bin --install
+cd ..
+pnpm build
+```
+
+The output is in `dist/`; its launcher files are copied from `public/`. For development with optimized Rust, use `pnpm start:release`.
+
+## Credits and license
+
+Built on noclip.website by Jasper St. Pierre and its contributors. Their renderer, format support and reverse-engineering work are the foundation of this fork. Original third-party credits are retained in [README_UPSTREAM.md](README_UPSTREAM.md). The original [LICENSE](LICENSE) is preserved.
+
+This independent fork was developed with assistance from OpenAI ChatGPT/Codex. It is not an official Blizzard or noclip.website release. World of Warcraft and its game assets belong to their respective rights holders.
+
+Report issues with this fork in this repository. The contribution policies in the preserved upstream README describe the original project, not this independent fork.

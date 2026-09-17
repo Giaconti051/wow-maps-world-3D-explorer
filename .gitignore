@@ -59,6 +59,9 @@ dist/
 
 .wireit
 
+WoW_Archaeology_BrowserData/
+*.zip
+
 __pycache__/
 *.pyc
 .venv/

@@ -5,7 +5,7 @@ import { AABB, Frustum } from "../Geometry.js";
 import { getMatrixTranslation, invlerp, lerp, projectionMatrixForFrustum, setMatrixTranslation, transformVec3Mat4w1 } from "../MathHelpers.js";
 import { SceneContext } from "../SceneBase.js";
 import { makeBackbufferDescSimple, standardFullClearRenderPassDescriptor } from "../gfx/helpers/RenderGraphHelpers.js";
-import { GfxClipSpaceNearZ, GfxCullMode, GfxDevice, GfxProgram } from "../gfx/platform/GfxPlatform.js";
+import { GfxClipSpaceNearZ, GfxCullMode, GfxDevice, GfxPlatform, GfxProgram } from "../gfx/platform/GfxPlatform.js";
 import { GfxrAttachmentSlot } from "../gfx/render/GfxRenderGraph.js";
 import { GfxRenderHelper } from "../gfx/render/GfxRenderHelper.js";
 import { gfxRenderInstCompareNone, GfxRenderInstExecutionOrder, GfxRenderInstList } from "../gfx/render/GfxRenderInstManager.js";
@@ -13,10 +13,11 @@ import { rust } from "../rustlib.js";
 import { assert } from "../util.js";
 import * as UI from "../ui.js";
 import * as Viewer from "../viewer.js";
-import { AdtCoord, AdtData, Database, DoodadData, LazyWorldData, ModelData, WmoData, WmoDefinition, WorldData, WowCache } from "./data.js";
-import { BaseProgram, LoadingAdtProgram, ModelProgram, ParticleProgram, SkyboxProgram, TerrainProgram, WaterProgram, WmoProgram } from "./program.js";
+import { AdtCoord, AdtData, Database, DoodadData, LazyWorldData, ModelData, TerrainDetailLevel, WmoData, WmoDefinition, WorldData, WowCache } from "./data.js";
+import { BaseProgram, ContinentalTerrainProgram, LoadingAdtProgram, ModelProgram, ParticleProgram, SkyboxProgram, TerrainProgram, WaterProgram, WmoProgram } from "./program.js";
 import { LoadingAdtRenderer, ModelRenderer, SkyboxRenderer, TerrainRenderer, WaterRenderer, WmoRenderer } from "./render.js";
 import { TextureCache } from "./tex.js";
+import { WowSpatialUpscaler, WowUpscaleMode } from "./upscale.js";
 
 export const MAP_SIZE = 17066;
 
@@ -61,7 +62,7 @@ export class View {
     public dayNight = 0;
     public deltaTime: number;
     public cullingNearPlane = 0.1;
-    public cullingFarPlane = 1000;
+    public cullingFarPlane = 10000;
     public cullingFrustum: Frustum = new Frustum();
     public timeOffset = 1440;
     public secondsPerGameDay = 90;
@@ -265,6 +266,62 @@ export class MapArray<K, V> {
     public values(): IterableIterator<V[]> {
         return this.map.values();
     }
+
+    public remove(key: K, value: V): void {
+        const values = this.map.get(key);
+        if (values === undefined)
+            return;
+        const index = values.indexOf(value);
+        if (index >= 0)
+            values.splice(index, 1);
+        if (values.length === 0)
+            this.map.delete(key);
+    }
+}
+
+interface AdtResourceRefs {
+    modelIds: Set<number>;
+    wmoIds: Set<number>;
+    wmoDefs: Set<WmoDefinition>;
+    doodads: Set<DoodadData>;
+    activeLodLevels: Set<number>;
+}
+
+interface AdtLodRequest {
+    adt: AdtData;
+    lodLevel: number;
+    distance: number;
+}
+
+interface WowArchaeologySettings {
+    version: 1;
+    atmosphericFog: boolean;
+    particles: boolean;
+    viewDistance: number;
+    residentRadius: number;
+    terrainDetailRadius: number;
+    ultraTerrainLod: boolean;
+    extremeTerrainLod: boolean;
+    continentalTerrainLod: boolean;
+    continentalTerrainDistance: number;
+    reduceDistantTextures: boolean;
+    distantTextureMinLod: number;
+    objectDetailRadius: number;
+    objectRadius: number;
+    dynamicTime: boolean;
+    timeOfDay: number;
+    renderScale: number;
+    upscaleMode: WowUpscaleMode;
+}
+
+const WOW_ARCHAEOLOGY_SETTINGS_KEY = 'wow-archaeology-settings-v1';
+
+function savedNumber(value: unknown, fallback: number, min: number, max: number): number {
+    return typeof value === 'number' && Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
+}
+
+function savedBoolean(value: unknown, fallback: boolean): boolean {
+    return typeof value === 'boolean' ? value : fallback;
 }
 
 interface CullWmoResult {
@@ -292,17 +349,39 @@ export class WdtScene implements Viewer.SceneGfx {
     private renderInstListSky = new GfxRenderInstList(gfxRenderInstCompareNone, GfxRenderInstExecutionOrder.Forwards);
 
     public ADT_LOD0_DISTANCE = 1000;
+    public TERRAIN_HIGH_DETAIL_DISTANCE = 2000;
+    public ULTRA_TERRAIN_LOD = false;
+    public EXTREME_TERRAIN_LOD = false;
+    public CONTINENTAL_TERRAIN_LOD = false;
+    public CONTINENTAL_TERRAIN_DISTANCE = 4000;
+    public REDUCE_DISTANT_TERRAIN_TEXTURES = false;
+    public DISTANT_TERRAIN_TEXTURE_MIN_LOD = 3;
+    public OBJECT_CULL_DISTANCE = 3000;
+    public RENDER_SCALE = 1.0;
+    public UPSCALE_MODE = WowUpscaleMode.EdgeAdaptive;
 
     private terrainProgram: GfxProgram;
+    private continentalTerrainProgram: GfxProgram;
     private waterProgram: GfxProgram;
     private modelProgram: GfxProgram;
     private wmoProgram: GfxProgram;
     private skyboxProgram: GfxProgram;
     private loadingAdtProgram: GfxProgram;
     private particleProgram: GfxProgram;
+    private spatialUpscaler: WowSpatialUpscaler;
+    private smoothedFrameMs = 0;
 
     private modelIdToDoodads = new MapArray<number, DoodadData>();
     private wmoIdToDefs = new MapArray<number, WmoDefinition>();
+    private adtResourceRefs = new Map<number, AdtResourceRefs>();
+    private modelRefCounts = new Map<number, number>();
+    private wmoRefCounts = new Map<number, number>();
+    private wmoSkyboxRefCounts = new Map<number, number>();
+    private wmoDefRefCounts = new Map<WmoDefinition, number>();
+    private doodadRefCounts = new Map<DoodadData, number>();
+    private adtLodQueue: AdtLodRequest[] = [];
+    private adtLodWorkerRunning = false;
+    private lastAdtLodQueueRefresh = 0;
 
     public mainView = new View();
     private textureCache: TextureCache;
@@ -310,8 +389,8 @@ export class WdtScene implements Viewer.SceneGfx {
     public currentAdtCoords: [number, number] = [0, 0];
     public loadingAdts: [number, number][] = [];
 
-    public enableFog = true;
-    public enableParticles = true;
+    public enableFog = false;
+    public enableParticles = false;
     public cullingState = CullingState.Running;
     public cameraState = CameraState.Running;
     public frozenCamera = vec3.create();
@@ -321,17 +400,23 @@ export class WdtScene implements Viewer.SceneGfx {
     private modelFrustum: ConvexHull;
 
     private timeOfDayPanel: UI.TimeOfDayPanel | null = null;
+    private diagnosticsElement: HTMLElement | null = null;
+    private lastDiagnosticsText = '';
+    private savedResidentRadius = 4;
 
     constructor(private device: GfxDevice, public world: WorldData | LazyWorldData, public renderHelper: GfxRenderHelper, private db: Database) {
         console.time("WdtScene construction");
+        this.loadSettings();
         this.textureCache = new TextureCache(this.renderHelper.renderCache);
         this.terrainProgram = this.renderHelper.renderCache.createProgram(new TerrainProgram());
+        this.continentalTerrainProgram = this.renderHelper.renderCache.createProgram(new ContinentalTerrainProgram());
         this.waterProgram = this.renderHelper.renderCache.createProgram(new WaterProgram());
         this.modelProgram = this.renderHelper.renderCache.createProgram(new ModelProgram());
         this.particleProgram = this.renderHelper.renderCache.createProgram(new ParticleProgram());
         this.wmoProgram = this.renderHelper.renderCache.createProgram(new WmoProgram());
         this.skyboxProgram = this.renderHelper.renderCache.createProgram(new SkyboxProgram());
         this.loadingAdtProgram = this.renderHelper.renderCache.createProgram(new LoadingAdtProgram());
+        this.spatialUpscaler = new WowSpatialUpscaler(this.renderHelper.renderCache);
 
         this.setupSkyboxes();
         if (this.world.globalWmo) {
@@ -349,11 +434,66 @@ export class WdtScene implements Viewer.SceneGfx {
         console.timeEnd("WdtScene construction");
     }
 
-    public setupWmoDef(def: WmoDefinition) {
-        this.wmoIdToDefs.appendUnique(def.wmoId, def);
-        for (let doodad of def.doodadIndexToDoodad.values()) {
-            this.modelIdToDoodads.appendUnique(doodad.modelId, doodad);
+    private loadSettings(): void {
+        try {
+            const serialized = window.localStorage.getItem(WOW_ARCHAEOLOGY_SETTINGS_KEY);
+            if (serialized === null)
+                return;
+            const settings = JSON.parse(serialized) as Partial<WowArchaeologySettings>;
+            this.enableFog = savedBoolean(settings.atmosphericFog, this.enableFog);
+            this.enableParticles = savedBoolean(settings.particles, this.enableParticles);
+            this.mainView.cullingFarPlane = savedNumber(settings.viewDistance, this.mainView.cullingFarPlane, 1000, 20000);
+            this.TERRAIN_HIGH_DETAIL_DISTANCE = savedNumber(settings.terrainDetailRadius, this.TERRAIN_HIGH_DETAIL_DISTANCE, 0, 10000);
+            this.ULTRA_TERRAIN_LOD = savedBoolean(settings.ultraTerrainLod, this.ULTRA_TERRAIN_LOD);
+            this.EXTREME_TERRAIN_LOD = savedBoolean(settings.extremeTerrainLod, this.EXTREME_TERRAIN_LOD);
+            this.CONTINENTAL_TERRAIN_LOD = savedBoolean(settings.continentalTerrainLod, this.CONTINENTAL_TERRAIN_LOD);
+            this.CONTINENTAL_TERRAIN_DISTANCE = savedNumber(settings.continentalTerrainDistance, this.CONTINENTAL_TERRAIN_DISTANCE, 0, 20000);
+            this.REDUCE_DISTANT_TERRAIN_TEXTURES = savedBoolean(settings.reduceDistantTextures, this.REDUCE_DISTANT_TERRAIN_TEXTURES);
+            this.DISTANT_TERRAIN_TEXTURE_MIN_LOD = savedNumber(settings.distantTextureMinLod, this.DISTANT_TERRAIN_TEXTURE_MIN_LOD, 1, 5);
+            this.ADT_LOD0_DISTANCE = savedNumber(settings.objectDetailRadius, this.ADT_LOD0_DISTANCE, 0, 5000);
+            this.OBJECT_CULL_DISTANCE = savedNumber(settings.objectRadius, this.OBJECT_CULL_DISTANCE, 500, 10000);
+            this.mainView.freezeTime = !savedBoolean(settings.dynamicTime, !this.mainView.freezeTime);
+            this.mainView.frozenTime = savedNumber(settings.timeOfDay, this.mainView.frozenTime / 2880, 0, 1) * 2880;
+            this.savedResidentRadius = savedNumber(settings.residentRadius, this.savedResidentRadius, 2, 12);
+            this.RENDER_SCALE = savedNumber(settings.renderScale, this.RENDER_SCALE, 0.33, 1.0);
+            this.UPSCALE_MODE = savedNumber(settings.upscaleMode, this.UPSCALE_MODE, WowUpscaleMode.Bilinear, WowUpscaleMode.EdgeAdaptive) as WowUpscaleMode;
+            if (this.world instanceof LazyWorldData)
+                this.world.adtRadius = this.savedResidentRadius;
+        } catch (e) {
+            console.warn('Could not restore WoW Archaeology settings:', e);
         }
+    }
+
+    private saveSettings(): void {
+        const settings: WowArchaeologySettings = {
+            version: 1,
+            atmosphericFog: this.enableFog,
+            particles: this.enableParticles,
+            viewDistance: this.mainView.cullingFarPlane,
+            residentRadius: this.world instanceof LazyWorldData ? this.world.adtRadius : this.savedResidentRadius,
+            terrainDetailRadius: this.TERRAIN_HIGH_DETAIL_DISTANCE,
+            ultraTerrainLod: this.ULTRA_TERRAIN_LOD,
+            extremeTerrainLod: this.EXTREME_TERRAIN_LOD,
+            continentalTerrainLod: this.CONTINENTAL_TERRAIN_LOD,
+            continentalTerrainDistance: this.CONTINENTAL_TERRAIN_DISTANCE,
+            reduceDistantTextures: this.REDUCE_DISTANT_TERRAIN_TEXTURES,
+            distantTextureMinLod: this.DISTANT_TERRAIN_TEXTURE_MIN_LOD,
+            objectDetailRadius: this.ADT_LOD0_DISTANCE,
+            objectRadius: this.OBJECT_CULL_DISTANCE,
+            dynamicTime: !this.mainView.freezeTime,
+            timeOfDay: this.mainView.frozenTime / 2880,
+            renderScale: this.RENDER_SCALE,
+            upscaleMode: this.UPSCALE_MODE,
+        };
+        try {
+            window.localStorage.setItem(WOW_ARCHAEOLOGY_SETTINGS_KEY, JSON.stringify(settings));
+        } catch (e) {
+            console.warn('Could not save WoW Archaeology settings:', e);
+        }
+    }
+
+    public setupWmoDef(def: WmoDefinition) {
+        this.retainWmoDef(def);
     }
 
     public getDefaultWorldMatrix(dst: mat4): void {
@@ -391,38 +531,222 @@ export class WdtScene implements Viewer.SceneGfx {
 
         this.terrainRenderers.set(adt.fileId, new TerrainRenderer(this.device, this.renderHelper, adt, this.textureCache));
         this.adtWaterRenderers.set(adt.fileId, new WaterRenderer(this.device, this.renderHelper, adt.liquids, adt.liquidTypes, this.textureCache));
-        for (let lodData of adt.lodData) {
-            for (let modelId of lodData.modelIds) {
-                const model = adt.models.get(modelId)!;
-                this.createModelRenderer(model);
-            }
-            for (let wmoDef of lodData.wmoDefs) {
-                this.setupWmo(adt.wmos.get(wmoDef.wmoId)!);
-                this.setupWmoDef(wmoDef);
-            }
-            for (let doodad of lodData.doodads) {
-                this.modelIdToDoodads.append(doodad.modelId, doodad);
+        const refs: AdtResourceRefs = {
+            modelIds: new Set(),
+            wmoIds: new Set(),
+            wmoDefs: new Set(),
+            doodads: new Set(),
+            activeLodLevels: new Set(),
+        };
+        this.adtResourceRefs.set(adt.fileId, refs);
+        for (let lodLevel = 0; lodLevel < adt.lodData.length; lodLevel++)
+            this.setupAdtLod(adt, lodLevel);
+    }
+
+    private setupAdtLod(adt: AdtData, lodLevel: number): void {
+        if (!adt.hasLodLevel(lodLevel))
+            return;
+        const refs = this.adtResourceRefs.get(adt.fileId);
+        if (refs === undefined)
+            return;
+        if (refs.activeLodLevels.has(lodLevel))
+            return;
+        const lodData = adt.lodData[lodLevel];
+        for (const modelId of lodData.modelIds) {
+            if (!refs.modelIds.has(modelId)) {
+                refs.modelIds.add(modelId);
+                this.retainModel(adt.models.get(modelId)!);
             }
         }
+        for (const wmoDef of lodData.wmoDefs) {
+            if (!refs.wmoIds.has(wmoDef.wmoId)) {
+                refs.wmoIds.add(wmoDef.wmoId);
+                this.retainWmo(adt.wmos.get(wmoDef.wmoId)!);
+            }
+            if (!refs.wmoDefs.has(wmoDef)) {
+                refs.wmoDefs.add(wmoDef);
+                this.retainWmoDef(wmoDef);
+            }
+        }
+        for (const doodad of lodData.doodads) {
+            if (!refs.doodads.has(doodad)) {
+                refs.doodads.add(doodad);
+                this.retainDoodad(doodad);
+            }
+        }
+        refs.activeLodLevels.add(lodLevel);
+    }
+
+    private releaseAdtObjectRefs(adt: AdtData): void {
+        const refs = this.adtResourceRefs.get(adt.fileId);
+        if (!refs)
+            return;
+        for (const doodad of refs.doodads)
+            this.releaseDoodad(doodad);
+        for (const def of refs.wmoDefs)
+            this.releaseWmoDef(def);
+        for (const wmoId of refs.wmoIds)
+            this.releaseWmo(adt.wmos.get(wmoId)!);
+        for (const modelId of refs.modelIds)
+            this.releaseModel(modelId);
+        refs.doodads.clear();
+        refs.wmoDefs.clear();
+        refs.wmoIds.clear();
+        refs.modelIds.clear();
+        refs.activeLodLevels.clear();
+    }
+
+    private setAdtActiveLods(adt: AdtData, desiredLodLevels: number[]): void {
+        const refs = this.adtResourceRefs.get(adt.fileId);
+        if (!refs)
+            return;
+        const desired = desiredLodLevels.filter((lodLevel) => adt.hasLodLevel(lodLevel));
+        const alreadyActive = desired.length === refs.activeLodLevels.size &&
+            desired.every((lodLevel) => refs.activeLodLevels.has(lodLevel));
+        if (alreadyActive)
+            return;
+        this.releaseAdtObjectRefs(adt);
+        for (const lodLevel of desired)
+            this.setupAdtLod(adt, lodLevel);
     }
 
     public setupWmo(wmo: WmoData) {
-        if (this.wmoRenderers.has(wmo.fileId))
+        this.retainWmo(wmo);
+    }
+
+    private retainModel(model: ModelData): void {
+        const count = this.modelRefCounts.get(model.fileId) ?? 0;
+        this.modelRefCounts.set(model.fileId, count + 1);
+        if (count === 0)
+            this.createModelRenderer(model);
+    }
+
+    private releaseModel(modelId: number): void {
+        const count = this.modelRefCounts.get(modelId);
+        if (count === undefined)
+            return;
+        if (count > 1) {
+            this.modelRefCounts.set(modelId, count - 1);
+            return;
+        }
+        this.modelRefCounts.delete(modelId);
+        const renderer = this.modelRenderers.get(modelId);
+        if (renderer) {
+            renderer.destroy(this.device);
+            this.modelRenderers.delete(modelId);
+        }
+    }
+
+    private retainWmo(wmo: WmoData): void {
+        const count = this.wmoRefCounts.get(wmo.fileId) ?? 0;
+        this.wmoRefCounts.set(wmo.fileId, count + 1);
+        if (count > 0)
             return;
 
         this.wmoRenderers.set(wmo.fileId, new WmoRenderer(this.device, wmo, this.textureCache, this.renderHelper));
         this.wmoWaterRenderers.set(wmo.fileId, new WaterRenderer(this.device, this.renderHelper, wmo.liquids, wmo.liquidTypes, this.textureCache));
-        for (let model of wmo.models.values()) {
-            this.createModelRenderer(model);
+        for (let model of wmo.models.values())
+            this.retainModel(model);
+        if (wmo.skyboxModel)
+            this.retainWmoSkybox(wmo.skyboxModel);
+    }
+
+    private releaseWmo(wmo: WmoData): void {
+        const count = this.wmoRefCounts.get(wmo.fileId);
+        if (count === undefined)
+            return;
+        if (count > 1) {
+            this.wmoRefCounts.set(wmo.fileId, count - 1);
+            return;
         }
-        if (wmo.skyboxModel) {
-            this.wmoSkyboxRenderers.set(wmo.skyboxModel.fileId, new ModelRenderer(this.device, wmo.skyboxModel, this.renderHelper, this.textureCache));
+        this.wmoRefCounts.delete(wmo.fileId);
+        this.wmoRenderers.get(wmo.fileId)?.destroy(this.device);
+        this.wmoRenderers.delete(wmo.fileId);
+        this.wmoWaterRenderers.get(wmo.fileId)?.destroy(this.device);
+        this.wmoWaterRenderers.delete(wmo.fileId);
+        for (const model of wmo.models.values())
+            this.releaseModel(model.fileId);
+        if (wmo.skyboxModel)
+            this.releaseWmoSkybox(wmo.skyboxModel.fileId);
+    }
+
+    private retainWmoSkybox(model: ModelData): void {
+        const count = this.wmoSkyboxRefCounts.get(model.fileId) ?? 0;
+        this.wmoSkyboxRefCounts.set(model.fileId, count + 1);
+        if (count === 0)
+            this.wmoSkyboxRenderers.set(model.fileId, new ModelRenderer(this.device, model, this.renderHelper, this.textureCache));
+    }
+
+    private releaseWmoSkybox(modelId: number): void {
+        const count = this.wmoSkyboxRefCounts.get(modelId);
+        if (count === undefined)
+            return;
+        if (count > 1) {
+            this.wmoSkyboxRefCounts.set(modelId, count - 1);
+            return;
         }
+        this.wmoSkyboxRefCounts.delete(modelId);
+        this.wmoSkyboxRenderers.get(modelId)?.destroy(this.device);
+        this.wmoSkyboxRenderers.delete(modelId);
     }
 
     public createModelRenderer(model: ModelData) {
         if (!this.modelRenderers.has(model.fileId))
             this.modelRenderers.set(model.fileId, new ModelRenderer(this.device, model, this.renderHelper, this.textureCache));
+    }
+
+    private retainDoodad(doodad: DoodadData): void {
+        const count = this.doodadRefCounts.get(doodad) ?? 0;
+        this.doodadRefCounts.set(doodad, count + 1);
+        if (count === 0)
+            this.modelIdToDoodads.appendUnique(doodad.modelId, doodad);
+    }
+
+    private releaseDoodad(doodad: DoodadData): void {
+        const count = this.doodadRefCounts.get(doodad);
+        if (count === undefined)
+            return;
+        if (count > 1) {
+            this.doodadRefCounts.set(doodad, count - 1);
+            return;
+        }
+        this.doodadRefCounts.delete(doodad);
+        this.modelIdToDoodads.remove(doodad.modelId, doodad);
+    }
+
+    private retainWmoDef(def: WmoDefinition): void {
+        const count = this.wmoDefRefCounts.get(def) ?? 0;
+        this.wmoDefRefCounts.set(def, count + 1);
+        if (count > 0)
+            return;
+        this.wmoIdToDefs.appendUnique(def.wmoId, def);
+        for (const doodad of def.doodadIndexToDoodad.values())
+            this.retainDoodad(doodad);
+    }
+
+    private releaseWmoDef(def: WmoDefinition): void {
+        const count = this.wmoDefRefCounts.get(def);
+        if (count === undefined)
+            return;
+        if (count > 1) {
+            this.wmoDefRefCounts.set(def, count - 1);
+            return;
+        }
+        this.wmoDefRefCounts.delete(def);
+        this.wmoIdToDefs.remove(def.wmoId, def);
+        for (const doodad of def.doodadIndexToDoodad.values())
+            this.releaseDoodad(doodad);
+    }
+
+    private unloadAdt(adt: AdtData): void {
+        this.terrainRenderers.get(adt.fileId)?.destroy(this.device);
+        this.terrainRenderers.delete(adt.fileId);
+        this.adtWaterRenderers.get(adt.fileId)?.destroy(this.device);
+        this.adtWaterRenderers.delete(adt.fileId);
+
+        this.releaseAdtObjectRefs(adt);
+        this.adtResourceRefs.delete(adt.fileId);
+        this.adtLodQueue = this.adtLodQueue.filter((request) => request.adt !== adt);
     }
 
     public freezeCamera() {
@@ -465,11 +789,31 @@ export class WdtScene implements Viewer.SceneGfx {
         // disable WMOs not in the frustum, and determine if any ADTs are
         // visible based on where the camera is
         const wmosToCull: Map<number, [WmoData, WmoDefinition]> = new Map();
+        const candidateAdts: AdtData[] = [];
+        const objectAdts = new Set<AdtData>();
         for (let adt of this.world.adts) {
             adt.worldSpaceAABB.centerPoint(scratchVec3);
             const distance = vec3.distance(worldCamera, scratchVec3);
+            // An ADT is roughly 533 m wide. Avoid all object/WMO work for
+            // resident tiles that cannot possibly reach the far plane.
+            if (distance > this.mainView.cullingFarPlane + 800)
+                continue;
+            candidateAdts.push(adt);
+            const terrainDistance = adt.worldSpaceAABB.distFromClosestPoint(worldCamera);
+            adt.terrainDetailLevel = terrainDistance < this.TERRAIN_HIGH_DETAIL_DISTANCE ? TerrainDetailLevel.High :
+                this.CONTINENTAL_TERRAIN_LOD && terrainDistance >= this.CONTINENTAL_TERRAIN_DISTANCE ? TerrainDetailLevel.Continental :
+                this.EXTREME_TERRAIN_LOD ? TerrainDetailLevel.Extreme :
+                this.ULTRA_TERRAIN_LOD ? TerrainDetailLevel.Ultra : TerrainDetailLevel.Low;
             adt.setLodLevel(distance < this.ADT_LOD0_DISTANCE ? 0 : 1);
-            adt.setupWmoCandidates(worldCamera, worldFrustum);
+            if (distance <= this.OBJECT_CULL_DISTANCE + 800) {
+                objectAdts.add(adt);
+                adt.setupWmoCandidates(worldCamera, worldFrustum);
+            } else {
+                // Keep the far ring terrain-only. Clear the previous frame's
+                // candidates so a tile that moved out of range cannot leak WMOs.
+                adt.insideWmoCandidates = [];
+                adt.visibleWmoCandidates = [];
+            }
 
             for (let def of adt.insideWmoCandidates) {
                 const wmo = adt.wmos.get(def.wmoId)!;
@@ -508,7 +852,7 @@ export class WdtScene implements Viewer.SceneGfx {
 
         const wmosAlreadyCulled = Array.from(wmosToCull.keys());
         wmosToCull.clear();
-        for (let adt of this.world.adts) {
+        for (let adt of candidateAdts) {
             if (exteriorVisible) {
                 if (aabbIsVisible(adt.worldSpaceAABB)) {
                     for (let i = 0; i < adt.chunkData.length; i++) {
@@ -523,16 +867,20 @@ export class WdtScene implements Viewer.SceneGfx {
                             frame.addAdtLiquid(adt, i);
                         }
                     }
-                    for (let doodad of adt.lodDoodads()) {
-                        if (aabbIsVisible(doodad.worldAABB)) {
-                            frame.addAdtDoodad(doodad);
+                    if (objectAdts.has(adt)) {
+                        for (let doodad of adt.lodDoodads()) {
+                            if (aabbIsVisible(doodad.worldAABB)) {
+                                frame.addAdtDoodad(doodad);
+                            }
                         }
                     }
                 }
-                for (let def of adt.visibleWmoCandidates) {
-                    const wmo = adt.wmos.get(def.wmoId)!;
-                    if (aabbIsVisible(def.worldAABB) && !wmosAlreadyCulled.includes(def.uniqueId)) {
-                        wmosToCull.set(def.uniqueId, [wmo, def]);
+                if (objectAdts.has(adt)) {
+                    for (let def of adt.visibleWmoCandidates) {
+                        const wmo = adt.wmos.get(def.wmoId)!;
+                        if (aabbIsVisible(def.worldAABB) && !wmosAlreadyCulled.includes(def.uniqueId)) {
+                            wmosToCull.set(def.uniqueId, [wmo, def]);
+                        }
                     }
                 }
             }
@@ -678,9 +1026,14 @@ export class WdtScene implements Viewer.SceneGfx {
 
         const frame = this.frozenFrameData !== null ? this.frozenFrameData : this.cull();
 
-        template.setGfxProgram(this.terrainProgram);
         for (let renderer of this.terrainRenderers.values()) {
-            renderer.prepareToRenderTerrain(renderInstManager, frame);
+            template.setGfxProgram(renderer.adt.terrainDetailLevel === TerrainDetailLevel.Continental ? this.continentalTerrainProgram : this.terrainProgram);
+            renderer.prepareToRenderTerrain(
+                renderInstManager,
+                frame,
+                this.REDUCE_DISTANT_TERRAIN_TEXTURES,
+                this.DISTANT_TERRAIN_TEXTURE_MIN_LOD,
+            );
         }
 
         template.setGfxProgram(this.wmoProgram);
@@ -761,10 +1114,65 @@ export class WdtScene implements Viewer.SceneGfx {
         lightingData.free();
     }
 
-    private updateCurrentAdt() {
+    private refreshAdtLodQueue(force = false): void {
+        if (!(this.world instanceof LazyWorldData))
+            return;
+        const now = performance.now();
+        if (!force && now - this.lastAdtLodQueueRefresh < 500)
+            return;
+        this.lastAdtLodQueueRefresh = now;
+
+        const requests: AdtLodRequest[] = [];
+        for (const adt of this.world.adts) {
+            const distance = adt.worldSpaceAABB.distFromClosestPoint(this.mainView.cameraPos);
+            if (distance > this.OBJECT_CULL_DISTANCE) {
+                this.setAdtActiveLods(adt, []);
+                continue;
+            }
+
+            // LOD 1 is always the first object stage. LOD 0 is requested only
+            // after the far representation exists and only near the camera.
+            if (!adt.hasLodLevel(1) && !adt.isLoadingLodLevel(1)) {
+                requests.push({ adt, lodLevel: 1, distance });
+                this.setAdtActiveLods(adt, []);
+                continue;
+            }
+
+            const wantsHighDetail = distance <= this.ADT_LOD0_DISTANCE;
+            if (wantsHighDetail && !adt.hasLodLevel(0) && !adt.isLoadingLodLevel(0))
+                requests.push({ adt, lodLevel: 0, distance });
+
+            this.setAdtActiveLods(adt, wantsHighDetail ? [1, 0] : [1]);
+        }
+
+        requests.sort((a, b) => a.distance - b.distance || b.lodLevel - a.lodLevel);
+        this.adtLodQueue = requests;
+        this.pumpAdtLodQueue();
+    }
+
+    private pumpAdtLodQueue(): void {
+        if (this.adtLodWorkerRunning)
+            return;
+        const request = this.adtLodQueue.shift();
+        if (request === undefined)
+            return;
+
+        this.adtLodWorkerRunning = true;
+        void request.adt.loadLod(this.world.cache, request.lodLevel).then(() => {
+            if (this.world.adts.includes(request.adt))
+                this.refreshAdtLodQueue(true);
+        }).catch((e) => {
+            console.error(`failed to load ADT object LOD ${request.lodLevel}:`, e);
+        }).finally(() => {
+            this.adtLodWorkerRunning = false;
+            this.refreshAdtLodQueue(true);
+        });
+    }
+
+    private updateCurrentAdt(force = false) {
         const adtCoords = this.getCurrentAdtCoords();
         if (adtCoords) {
-            if (this.currentAdtCoords[0] !== adtCoords[0] || this.currentAdtCoords[1] !== adtCoords[1]) {
+            if (force || this.currentAdtCoords[0] !== adtCoords[0] || this.currentAdtCoords[1] !== adtCoords[1]) {
                 this.currentAdtCoords = adtCoords;
                 if (this.enableProgressiveLoading && "onEnterAdt" in this.world) {
                     const newCoords = this.world.onEnterAdt(
@@ -773,12 +1181,17 @@ export class WdtScene implements Viewer.SceneGfx {
                             this.loadingAdts = this.loadingAdts.filter(([x, y]) => !(x === coord[0] && y === coord[1]));
                             if (maybeAdt) {
                                 this.setupAdt(maybeAdt);
+                                this.refreshAdtLodQueue(true);
                             }
+                        },
+                        (_coord: AdtCoord, adt: AdtData) => {
+                            this.unloadAdt(adt);
                         },
                     );
                     for (let coord of newCoords) {
                         this.loadingAdts.push(coord);
                     }
+                    this.refreshAdtLodQueue(true);
                 }
             }
         }
@@ -817,16 +1230,26 @@ export class WdtScene implements Viewer.SceneGfx {
     }
 
     public render(device: GfxDevice, viewerInput: Viewer.ViewerRenderInput): void {
-        viewerInput.camera.setClipPlanes(0.1);
+        if (viewerInput.deltaTime > 0 && viewerInput.deltaTime < 250)
+            this.smoothedFrameMs = this.smoothedFrameMs === 0 ? viewerInput.deltaTime : lerp(this.smoothedFrameMs, viewerInput.deltaTime, 0.08);
+        viewerInput.camera.setClipPlanes(0.1, this.mainView.cullingFarPlane);
+        this.mainView.fogEnabled = this.enableFog;
         this.mainView.setupFromViewerInput(viewerInput);
         this.updateCurrentAdt();
+        this.refreshAdtLodQueue();
+        this.updateDiagnostics();
 
         if (this.timeOfDayPanel !== null && !this.mainView.freezeTime) {
             this.timeOfDayPanel.setTime(this.mainView.time / 2880);
         }
 
-        const mainColorDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, viewerInput, standardFullClearRenderPassDescriptor);
-        const mainDepthDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.DepthStencil, viewerInput, standardFullClearRenderPassDescriptor);
+        const scaledRenderInput = {
+            backbufferWidth: Math.max(1, Math.floor(viewerInput.backbufferWidth * this.RENDER_SCALE)),
+            backbufferHeight: Math.max(1, Math.floor(viewerInput.backbufferHeight * this.RENDER_SCALE)),
+            antialiasingMode: viewerInput.antialiasingMode,
+        };
+        const mainColorDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, scaledRenderInput, standardFullClearRenderPassDescriptor);
+        const mainDepthDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.DepthStencil, scaledRenderInput, standardFullClearRenderPassDescriptor);
 
         const builder = this.renderHelper.renderGraph.newGraphBuilder();
 
@@ -851,8 +1274,15 @@ export class WdtScene implements Viewer.SceneGfx {
             });
         });
         this.renderHelper.debugDraw.pushPasses(builder, mainColorTargetID, mainDepthTargetID);
-        this.renderHelper.antialiasingSupport.pushPasses(builder, viewerInput, mainColorTargetID);
-        builder.resolveRenderTargetToExternalTexture(mainColorTargetID, viewerInput.onscreenTexture);
+        this.renderHelper.antialiasingSupport.pushPasses(builder, scaledRenderInput, mainColorTargetID);
+        if (this.RENDER_SCALE < 0.995) {
+            const outputColorDesc = makeBackbufferDescSimple(GfxrAttachmentSlot.Color0, viewerInput, standardFullClearRenderPassDescriptor);
+            const outputColorTargetID = builder.createRenderTargetID(outputColorDesc, 'Upscaled Color');
+            this.spatialUpscaler.pushPass(builder, this.renderHelper, mainColorTargetID, outputColorTargetID, this.UPSCALE_MODE);
+            builder.resolveRenderTargetToExternalTexture(outputColorTargetID, viewerInput.onscreenTexture);
+        } else {
+            builder.resolveRenderTargetToExternalTexture(mainColorTargetID, viewerInput.onscreenTexture);
+        }
 
         this.prepareToRender();
         builder.execute();
@@ -860,14 +1290,199 @@ export class WdtScene implements Viewer.SceneGfx {
         this.renderInstListSky.reset();
     }
 
+    private updateDiagnostics(): void {
+        if (this.diagnosticsElement === null)
+            return;
+        const platform = this.device.queryVendorInfo().platform === GfxPlatform.WebGPU ? 'WebGPU' : 'WebGL 2';
+        const cache = this.world.cache.dataFetcher.cacheStats;
+        const cacheErrors = cache.readErrors + cache.writeErrors;
+        const lodLoading = this.adtLodQueue.length + (this.adtLodWorkerRunning ? 1 : 0);
+        let terrainHigh = 0, terrainLow = 0, terrainUltra = 0, terrainExtreme = 0, terrainContinental = 0;
+        for (const adt of this.world.adts) {
+            if (adt.terrainDetailLevel === TerrainDetailLevel.High)
+                terrainHigh++;
+            else if (adt.terrainDetailLevel === TerrainDetailLevel.Low)
+                terrainLow++;
+            else if (adt.terrainDetailLevel === TerrainDetailLevel.Ultra)
+                terrainUltra++;
+            else if (adt.terrainDetailLevel === TerrainDetailLevel.Extreme)
+                terrainExtreme++;
+            else
+                terrainContinental++;
+        }
+        const textureMode = this.REDUCE_DISTANT_TERRAIN_TEXTURES ? `mip ${this.DISTANT_TERRAIN_TEXTURE_MIN_LOD}+` : 'full';
+        const fps = this.smoothedFrameMs > 0 ? (1000 / this.smoothedFrameMs).toFixed(0) : '--';
+        const sourceWidth = Math.max(1, Math.floor((this.mainView.backbufferWidth || 1) * this.RENDER_SCALE));
+        const sourceHeight = Math.max(1, Math.floor((this.mainView.backbufferHeight || 1) * this.RENDER_SCALE));
+        const upscaleName = ['bilinear', 'sharp', 'edge-adaptive'][this.UPSCALE_MODE];
+        const text = `GPU: ${platform} | FPS: ${fps} (${this.smoothedFrameMs.toFixed(1)} ms) | Render: ${Math.round(this.RENDER_SCALE * 100)}% ${sourceWidth}x${sourceHeight}${this.RENDER_SCALE < 0.995 ? ` -> ${upscaleName}` : ''}\nADTs: ${this.world.adts.length} | Terrain HD/LD/U/X/C: ${terrainHigh}/${terrainLow}/${terrainUltra}/${terrainExtreme}/${terrainContinental} | Far textures: ${textureMode} | Models: ${this.modelRenderers.size} | WMOs: ${this.wmoRenderers.size} | Terrain queue: ${this.loadingAdts.length} | Object queue: ${lodLoading}\nCache hit/miss: ${cache.hits}/${cache.misses} | Network: ${cache.networkRequests} | Writes: ${cache.writes} | Errors: ${cacheErrors}`;
+        if (text !== this.lastDiagnosticsText) {
+            this.diagnosticsElement.textContent = text;
+            this.lastDiagnosticsText = text;
+        }
+    }
+
     public createPanels(): UI.Panel[] {
-        // Don't show time panel for interior WMO scenes
-        if (this.mainView.freezeTime) {
+        // Global WMO scenes do not use the continent streaming controls. A
+        // manually frozen time-of-day is not an interior scene and must not
+        // hide the Archaeology panel after settings are restored.
+        if (this.world.globalWmo) {
             return [];
         }
 
+        const archaeologyPanel = new UI.Panel();
+        archaeologyPanel.customHeaderBackgroundColor = UI.COOL_BLUE_COLOR;
+        archaeologyPanel.setTitle(UI.RENDER_HACKS_ICON, 'World Explorer Settings');
+
+        const cacheNotice = document.createElement('div');
+        cacheNotice.textContent = 'Downloads and viewer settings stay on disk; distant resources are released.';
+        cacheNotice.style.color = '#bbb';
+        cacheNotice.style.fontSize = '13px';
+        cacheNotice.style.paddingBottom = '6px';
+        archaeologyPanel.contents.appendChild(cacheNotice);
+
+        const fogCheckbox = new UI.Checkbox('Atmospheric fog', this.enableFog);
+        fogCheckbox.onchanged = () => {
+            this.enableFog = fogCheckbox.checked;
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(fogCheckbox.elem);
+
+        const particlesCheckbox = new UI.Checkbox('Particles', this.enableParticles);
+        particlesCheckbox.onchanged = () => {
+            this.enableParticles = particlesCheckbox.checked;
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(particlesCheckbox.elem);
+
+        const renderScaleSlider = new UI.Slider(`Render scale: ${Math.round(this.RENDER_SCALE * 100)}%`, Math.round(this.RENDER_SCALE * 100), 33, 100);
+        renderScaleSlider.setRange(33, 100, 1);
+        renderScaleSlider.onvalue = (percentage: number) => {
+            this.RENDER_SCALE = percentage / 100;
+            renderScaleSlider.setLabel(`Render scale: ${percentage}%`);
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(renderScaleSlider.elem);
+
+        const upscaleButtons = new UI.RadioButtons('Upscaler', ['Bilinear', 'Sharp', 'Edge-adaptive']);
+        upscaleButtons.setSelectedIndex(this.UPSCALE_MODE);
+        upscaleButtons.onselectedchange = () => {
+            this.UPSCALE_MODE = upscaleButtons.selectedIndex as WowUpscaleMode;
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(upscaleButtons.elem);
+
+        const viewDistanceSlider = new UI.Slider(`View distance: ${(this.mainView.cullingFarPlane / 1000).toFixed(1)} km`, this.mainView.cullingFarPlane, 1000, 20000);
+        viewDistanceSlider.setRange(1000, 20000, 500);
+        viewDistanceSlider.onvalue = (distance: number) => {
+            this.mainView.cullingFarPlane = distance;
+            viewDistanceSlider.setLabel(`View distance: ${(distance / 1000).toFixed(1)} km`);
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(viewDistanceSlider.elem);
+
+        if (this.world instanceof LazyWorldData) {
+            const lazyWorld = this.world;
+            const radius = lazyWorld.adtRadius;
+            const streamRadiusSlider = new UI.Slider(`Resident radius: ${radius} tiles`, radius, 2, 12);
+            streamRadiusSlider.setRange(2, 12, 1);
+            streamRadiusSlider.onvalue = (newRadius: number) => {
+                lazyWorld.adtRadius = newRadius;
+                this.savedResidentRadius = newRadius;
+                streamRadiusSlider.setLabel(`Resident radius: ${newRadius} tiles (~${(newRadius * 0.533).toFixed(1)} km)`);
+                this.updateCurrentAdt(true);
+                this.saveSettings();
+            };
+            archaeologyPanel.contents.appendChild(streamRadiusSlider.elem);
+        }
+
+        const terrainDetailSlider = new UI.Slider(`Terrain detail radius: ${(this.TERRAIN_HIGH_DETAIL_DISTANCE / 1000).toFixed(1)} km`, this.TERRAIN_HIGH_DETAIL_DISTANCE, 0, 10000);
+        terrainDetailSlider.setRange(0, 10000, 250);
+        terrainDetailSlider.onvalue = (distance: number) => {
+            this.TERRAIN_HIGH_DETAIL_DISTANCE = distance;
+            terrainDetailSlider.setLabel(`Terrain detail radius: ${(distance / 1000).toFixed(1)} km`);
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(terrainDetailSlider.elem);
+
+        const ultraTerrainCheckbox = new UI.Checkbox('Ultra terrain LOD (distant)', this.ULTRA_TERRAIN_LOD);
+        ultraTerrainCheckbox.onchanged = () => {
+            this.ULTRA_TERRAIN_LOD = ultraTerrainCheckbox.checked;
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(ultraTerrainCheckbox.elem);
+
+        const extremeTerrainCheckbox = new UI.Checkbox('Extreme terrain LOD (overrides Ultra)', this.EXTREME_TERRAIN_LOD);
+        extremeTerrainCheckbox.onchanged = () => {
+            this.EXTREME_TERRAIN_LOD = extremeTerrainCheckbox.checked;
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(extremeTerrainCheckbox.elem);
+
+        const continentalTerrainCheckbox = new UI.Checkbox('Continental terrain LOD (one draw per ADT)', this.CONTINENTAL_TERRAIN_LOD);
+        continentalTerrainCheckbox.onchanged = () => {
+            this.CONTINENTAL_TERRAIN_LOD = continentalTerrainCheckbox.checked;
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(continentalTerrainCheckbox.elem);
+
+        const continentalDistanceSlider = new UI.Slider(`Continental radius: ${(this.CONTINENTAL_TERRAIN_DISTANCE / 1000).toFixed(1)} km`, this.CONTINENTAL_TERRAIN_DISTANCE, 0, 20000);
+        continentalDistanceSlider.setRange(0, 20000, 250);
+        continentalDistanceSlider.onvalue = (distance: number) => {
+            this.CONTINENTAL_TERRAIN_DISTANCE = distance;
+            continentalDistanceSlider.setLabel(`Continental radius: ${(distance / 1000).toFixed(1)} km`);
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(continentalDistanceSlider.elem);
+
+        const reduceTexturesCheckbox = new UI.Checkbox('Reduce distant texture detail', this.REDUCE_DISTANT_TERRAIN_TEXTURES);
+        reduceTexturesCheckbox.onchanged = () => {
+            this.REDUCE_DISTANT_TERRAIN_TEXTURES = reduceTexturesCheckbox.checked;
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(reduceTexturesCheckbox.elem);
+
+        const textureLodSlider = new UI.Slider(`Distant texture reduction: ${this.DISTANT_TERRAIN_TEXTURE_MIN_LOD} level${this.DISTANT_TERRAIN_TEXTURE_MIN_LOD === 1 ? '' : 's'}`, this.DISTANT_TERRAIN_TEXTURE_MIN_LOD, 1, 5);
+        textureLodSlider.setRange(1, 5, 1);
+        textureLodSlider.onvalue = (lod: number) => {
+            this.DISTANT_TERRAIN_TEXTURE_MIN_LOD = lod;
+            textureLodSlider.setLabel(`Distant texture reduction: ${lod} level${lod === 1 ? '' : 's'}`);
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(textureLodSlider.elem);
+
+        const lodDistanceSlider = new UI.Slider(`Object detail radius: ${(this.ADT_LOD0_DISTANCE / 1000).toFixed(1)} km`, this.ADT_LOD0_DISTANCE, 0, 5000);
+        lodDistanceSlider.setRange(0, 5000, 250);
+        lodDistanceSlider.onvalue = (distance: number) => {
+            this.ADT_LOD0_DISTANCE = distance;
+            lodDistanceSlider.setLabel(`Object detail radius: ${(distance / 1000).toFixed(1)} km`);
+            this.refreshAdtLodQueue(true);
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(lodDistanceSlider.elem);
+
+        const objectDistanceSlider = new UI.Slider(`Object radius: ${(this.OBJECT_CULL_DISTANCE / 1000).toFixed(1)} km`, this.OBJECT_CULL_DISTANCE, 500, 10000);
+        objectDistanceSlider.setRange(500, 10000, 250);
+        objectDistanceSlider.onvalue = (distance: number) => {
+            this.OBJECT_CULL_DISTANCE = distance;
+            objectDistanceSlider.setLabel(`Object radius: ${(distance / 1000).toFixed(1)} km`);
+            this.refreshAdtLodQueue(true);
+            this.saveSettings();
+        };
+        archaeologyPanel.contents.appendChild(objectDistanceSlider.elem);
+
+        this.diagnosticsElement = document.createElement('div');
+        this.diagnosticsElement.style.color = '#9fd3ff';
+        this.diagnosticsElement.style.fontSize = '12px';
+        this.diagnosticsElement.style.lineHeight = '1.4';
+        this.diagnosticsElement.style.paddingTop = '8px';
+        archaeologyPanel.contents.appendChild(this.diagnosticsElement);
+        this.updateDiagnostics();
+
         this.timeOfDayPanel = new UI.TimeOfDayPanel();
-        this.timeOfDayPanel.setTime(this.mainView.time / 2880);
+        this.timeOfDayPanel.setDynamicTime(!this.mainView.freezeTime);
+        const panelTime = this.mainView.freezeTime || !Number.isFinite(this.mainView.time) ? this.mainView.frozenTime : this.mainView.time;
+        this.timeOfDayPanel.setTime(panelTime / 2880);
 
         this.timeOfDayPanel.onvaluechange = (t: number, useDynamicTime: boolean) => {
             if (useDynamicTime) {
@@ -876,12 +1491,14 @@ export class WdtScene implements Viewer.SceneGfx {
                 this.mainView.freezeTime = true;
                 this.mainView.frozenTime = t * 2880;
             }
+            this.saveSettings();
         };
 
-        return [this.timeOfDayPanel];
+        return [archaeologyPanel, this.timeOfDayPanel];
     }
 
     public destroy(device: GfxDevice): void {
+        this.saveSettings();
         for (let renderer of this.terrainRenderers.values()) {
             renderer.destroy(device);
         }
@@ -898,6 +1515,9 @@ export class WdtScene implements Viewer.SceneGfx {
             renderer.destroy(device);
         }
         for (let renderer of this.skyboxModelRenderers.values()) {
+            renderer.destroy(device);
+        }
+        for (let renderer of this.wmoSkyboxRenderers.values()) {
             renderer.destroy(device);
         }
         this.loadingAdtRenderer.destroy(device);

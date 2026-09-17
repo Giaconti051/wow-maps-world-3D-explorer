@@ -144,7 +144,7 @@ import { GfxPlatform } from './gfx/platform/GfxPlatform.js';
 import { SaveState, SaveStateSerializer } from './SaveState.js';
 import ArrayBufferSlice from './ArrayBufferSlice.js';
 
-const sceneGroups: (string | SceneGroup)[] = [
+const upstreamSceneGroups: (string | SceneGroup)[] = [
     "Development",
     Scenes_Example.sceneGroup,
     "Wii",
@@ -279,6 +279,12 @@ const sceneGroups: (string | SceneGroup)[] = [
     Scenes_TokyoMirageSessionsSharpFE.sceneGroup,
     Scenes_TopGearRally.sceneGroup,
     Scenes_KingdomHeartsBBS.sceneGroup,
+];
+
+const sceneGroups: (string | SceneGroup)[] = [
+    Scenes_WorldOfWarcraft.vanillaSceneGroup,
+    Scenes_WorldOfWarcraft.bcSceneGroup,
+    Scenes_WorldOfWarcraft.wotlkSceneGroup,
 ];
 
 enum SaveStatesAction {
@@ -1050,10 +1056,28 @@ class Main {
                 this.viewer.setScene(scene);
                 this._onSceneChanged(scene, saveState, timeState);
             }
+        }, (error: unknown) => {
+            if (this.loadingSceneDesc === sceneDesc)
+                this.loadingSceneDesc = null;
+
+            console.error(`Failed to load scene ${sceneDesc.id}:`, error);
+            const errorMessage = document.createElement('div');
+            errorMessage.style.position = 'absolute';
+            errorMessage.style.left = '50%';
+            errorMessage.style.top = '50%';
+            errorMessage.style.transform = 'translate(-50%, -50%)';
+            errorMessage.style.padding = '16px';
+            errorMessage.style.background = 'rgba(0, 0, 0, 0.9)';
+            errorMessage.style.color = '#ff7777';
+            errorMessage.style.font = '16px monospace';
+            errorMessage.style.maxWidth = '70%';
+            errorMessage.style.zIndex = '1000';
+            errorMessage.textContent = `Unable to load this map: ${error instanceof Error ? error.message : String(error)}`;
+            uiContainer.appendChild(errorMessage);
         });
 
         // Set window title.
-        document.title = `${sceneDesc.name} - ${sceneGroup.name} - noclip`;
+        document.title = `${sceneDesc.name} - ${sceneGroup.name} - World of Warcraft Maps and World 3D Explorer`;
     }
 
     // SceneLoader API

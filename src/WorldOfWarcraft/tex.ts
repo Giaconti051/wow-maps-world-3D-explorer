@@ -173,12 +173,12 @@ export class TextureCache {
         }
     }
 
-    public getSampler(samplerSettings: SamplerSettings): GfxSampler {
+    public getSampler(samplerSettings: SamplerSettings, minLOD = 0): GfxSampler {
         return this.renderCache.createSampler({
             minFilter: GfxTexFilterMode.Bilinear,
             magFilter: GfxTexFilterMode.Bilinear,
             mipFilter: GfxMipFilterMode.Linear,
-            minLOD: 0,
+            minLOD,
             maxLOD: 100,
             wrapS: samplerSettings.wrapS
                 ? GfxWrapMode.Repeat

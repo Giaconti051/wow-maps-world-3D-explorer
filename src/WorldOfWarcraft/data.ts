@@ -1586,6 +1586,14 @@ export class LiquidInstance {
     }
 }
 
+export enum TerrainDetailLevel {
+    High,
+    Low,
+    Ultra,
+    Extreme,
+    Continental,
+}
+
 export class AdtData {
     public blps: Map<number, BlpData> = new Map();
     public models: Map<number, ModelData> = new Map();
@@ -1593,8 +1601,9 @@ export class AdtData {
     public worldSpaceAABB: AABB = new AABB();
     public hasBigAlpha: boolean;
     public hasHeightTexturing: boolean;
-    public lodLevel: number;
-    public lodData: AdtLodData[] = [];
+    public lodLevel: number = 1;
+    public terrainDetailLevel = TerrainDetailLevel.High;
+    public lodData: AdtLodData[] = [new AdtLodData(), new AdtLodData()];
     public visible = true;
     public chunkData: ChunkData[] = [];
     public liquids: LiquidInstance[] = [];
@@ -1603,17 +1612,37 @@ export class AdtData {
     public visibleWmoCandidates: WmoDefinition[] = [];
     private vertexBuffer: Float32Array;
     private indexBuffer: Uint16Array;
+    private lowDetailIndexBuffer: Uint16Array;
+    private ultraDetailIndexBuffer: Uint16Array;
+    private extremeDetailIndexBuffer: Uint16Array;
     private inner: WowAdt | null = null;
+    private loadedLodLevels = new Set<number>();
+    private lodLoadPromises = new Map<number, Promise<void>>();
 
-    constructor(public fileId: number, adt: WowAdt, public lightdbMapId: number) {
+    constructor(public fileId: number, adt: WowAdt, public lightdbMapId: number, private fileIDs: WowMapFileDataIDsLike) {
         this.inner = adt;
     }
 
-    public setLodLevel(lodLevel: number) {
+    public setLodLevel(lodLevel: number): boolean {
         assert(lodLevel === 0 || lodLevel === 1, "lodLevel must be 0 or 1");
-        if (this.lodLevel === lodLevel)
-            return;
-        this.lodLevel = lodLevel;
+        if (this.loadedLodLevels.has(lodLevel)) {
+            this.lodLevel = lodLevel;
+            return true;
+        }
+        const fallback = lodLevel === 0 ? 1 : 0;
+        if (this.loadedLodLevels.has(fallback)) {
+            this.lodLevel = fallback;
+            return true;
+        }
+        return false;
+    }
+
+    public hasLodLevel(lodLevel: number): boolean {
+        return this.loadedLodLevels.has(lodLevel);
+    }
+
+    public isLoadingLodLevel(lodLevel: number): boolean {
+        return this.lodLoadPromises.has(lodLevel);
     }
 
     private async loadTextures(cache: WowCache): Promise<unknown> {
@@ -1632,27 +1661,8 @@ export class AdtData {
         );
     }
 
-    private async loadLODs(cache: WowCache): Promise<unknown> {
-        return Promise.all(
-            this.lodData.map(async (lodData, i) => {
-                return lodData.load(cache, this.inner!, i);
-            }),
-        );
-    }
-
     public async load(cache: WowCache) {
-        this.lodData.push(new AdtLodData()); // LOD Level 0
-        this.lodData.push(new AdtLodData()); // LOD Level 1
-
-        await Promise.all([this.loadTextures(cache), this.loadLODs(cache)]);
-        this.setLodLevel(0);
-
-        for (const lodData of this.lodData) {
-            for (const [k, v] of lodData.wmos)
-                this.wmos.set(k, v);
-            for (const [k, v] of lodData.models)
-                this.models.set(k, v);
-        }
+        await this.loadTextures(cache);
 
         const renderResult = this.inner!.get_render_result(
             this.hasBigAlpha,
@@ -1699,21 +1709,141 @@ export class AdtData {
             }
             i += 1;
         }
+        this.lowDetailIndexBuffer = this.buildDetailIndexBuffer(2, TerrainDetailLevel.Low);
+        this.ultraDetailIndexBuffer = this.buildDetailIndexBuffer(4, TerrainDetailLevel.Ultra);
+        this.extremeDetailIndexBuffer = this.buildDetailIndexBuffer(8, TerrainDetailLevel.Extreme);
         renderResult.free();
 
         this.inner!.free();
         this.inner = null;
     }
 
+    public async loadLod(cache: WowCache, lodLevel: number): Promise<void> {
+        assert(lodLevel === 0 || lodLevel === 1, "lodLevel must be 0 or 1");
+        if (this.loadedLodLevels.has(lodLevel))
+            return;
+        const existingPromise = this.lodLoadPromises.get(lodLevel);
+        if (existingPromise !== undefined)
+            return existingPromise;
+
+        const promise = this.loadLodInner(cache, lodLevel);
+        this.lodLoadPromises.set(lodLevel, promise);
+        try {
+            await promise;
+            this.loadedLodLevels.add(lodLevel);
+            this.setLodLevel(lodLevel);
+        } catch (e) {
+            this.lodData[lodLevel] = new AdtLodData();
+            throw e;
+        } finally {
+            this.lodLoadPromises.delete(lodLevel);
+        }
+    }
+
+    private async loadLodInner(cache: WowCache, lodLevel: number): Promise<void> {
+        const [rootFile, obj0File, obj1File] = await Promise.all([
+            cache.fetchDataByFileID(this.fileIDs.root_adt),
+            cache.fetchDataByFileID(this.fileIDs.obj0_adt),
+            lodLevel === 1 && this.fileIDs.obj1_adt !== 0
+                ? cache.fetchDataByFileID(this.fileIDs.obj1_adt)
+                : Promise.resolve(null),
+        ]);
+        const objectAdt = rust.WowAdt.new(rootFile);
+        try {
+            objectAdt.append_obj_adt(obj0File);
+            if (obj1File !== null)
+                objectAdt.append_lod_obj_adt(obj1File);
+            const lodData = this.lodData[lodLevel];
+            await lodData.load(cache, objectAdt, lodLevel);
+            for (const [k, v] of lodData.wmos)
+                this.wmos.set(k, v);
+            for (const [k, v] of lodData.models)
+                this.models.set(k, v);
+        } finally {
+            objectAdt.free();
+        }
+    }
+
     public lodDoodads(): DoodadData[] {
-        return this.lodData[this.lodLevel].doodads;
+        return this.loadedLodLevels.has(this.lodLevel) ? this.lodData[this.lodLevel].doodads : [];
     }
 
     public lodWmoDefs(): WmoDefinition[] {
-        return this.lodData[this.lodLevel].wmoDefs;
+        return this.loadedLodLevels.has(this.lodLevel) ? this.lodData[this.lodLevel].wmoDefs : [];
     }
 
-    public getBuffers(device: GfxDevice): [GfxVertexBufferDescriptor, GfxIndexBufferDescriptor] {
+    private buildDetailIndexBuffer(coarseStep: number, detailLevel: TerrainDetailLevel): Uint16Array {
+        const indices: number[] = [];
+        const verticesPerChunk = 9 * 9 + 8 * 8;
+        const cellsPerSide = 8;
+
+        for (let chunkIndex = 0; chunkIndex < this.chunkData.length; chunkIndex++) {
+            const chunk = this.chunkData[chunkIndex];
+            const chunkVertexOffset = chunkIndex * verticesPerChunk;
+            const cellIndices: (Uint16Array | undefined)[] = new Array(cellsPerSide * cellsPerSide);
+            const sourceEnd = chunk.indexOffset + chunk.indexCount;
+
+            // Each non-hole cell contributes four triangles (12 indices). The
+            // second index is its top-left outer vertex, which lets us retain
+            // holes while rebuilding a coarser grid.
+            for (let offset = chunk.indexOffset; offset < sourceEnd; offset += 12) {
+                const topLeft = this.indexBuffer[offset + 1] - chunkVertexOffset;
+                const x = topLeft % 17;
+                const y = Math.floor(topLeft / 17);
+                cellIndices[y * cellsPerSide + x] = this.indexBuffer.subarray(offset, offset + 12);
+            }
+
+            if (detailLevel === TerrainDetailLevel.Extreme)
+                chunk.extremeDetailIndexOffset = indices.length;
+            else if (detailLevel === TerrainDetailLevel.Ultra)
+                chunk.ultraDetailIndexOffset = indices.length;
+            else
+                chunk.lowDetailIndexOffset = indices.length;
+            for (let y = 0; y < cellsPerSide; y += coarseStep) {
+                for (let x = 0; x < cellsPerSide; x += coarseStep) {
+                    let complete = true;
+                    for (let dy = 0; dy < coarseStep; dy++)
+                        for (let dx = 0; dx < coarseStep; dx++)
+                            complete &&= cellIndices[(y + dy) * cellsPerSide + x + dx] !== undefined;
+
+                    if (complete) {
+                        const a = chunkVertexOffset + 17 * y + x;
+                        const b = chunkVertexOffset + 17 * y + x + coarseStep;
+                        const c = chunkVertexOffset + 17 * (y + coarseStep) + x;
+                        const d = chunkVertexOffset + 17 * (y + coarseStep) + x + coarseStep;
+                        indices.push(a, c, d, a, d, b);
+                    } else if (detailLevel === TerrainDetailLevel.Extreme) {
+                        // A completely flat two-triangle chunk would seal cave
+                        // entrances and terrain holes. Fall back only that chunk
+                        // to the already-built Ultra mesh.
+                        const start = chunk.ultraDetailIndexOffset;
+                        const end = start + chunk.ultraDetailIndexCount;
+                        indices.push(...this.ultraDetailIndexBuffer.subarray(start, end));
+                    } else {
+                        // Around holes, retain the original cells so the low
+                        // LOD never bridges intentionally empty terrain.
+                        for (let dy = 0; dy < coarseStep; dy++) {
+                            for (let dx = 0; dx < coarseStep; dx++) {
+                                const original = cellIndices[(y + dy) * cellsPerSide + x + dx];
+                                if (original !== undefined)
+                                    indices.push(...original);
+                            }
+                        }
+                    }
+                }
+            }
+            if (detailLevel === TerrainDetailLevel.Extreme)
+                chunk.extremeDetailIndexCount = indices.length - chunk.extremeDetailIndexOffset;
+            else if (detailLevel === TerrainDetailLevel.Ultra)
+                chunk.ultraDetailIndexCount = indices.length - chunk.ultraDetailIndexOffset;
+            else
+                chunk.lowDetailIndexCount = indices.length - chunk.lowDetailIndexOffset;
+        }
+
+        return new Uint16Array(indices);
+    }
+
+    public getBuffers(device: GfxDevice): [GfxVertexBufferDescriptor, GfxIndexBufferDescriptor, GfxIndexBufferDescriptor, GfxIndexBufferDescriptor, GfxIndexBufferDescriptor] {
         const vertexBuffer = {
             buffer: createBufferFromData(
                 device,
@@ -1730,9 +1860,36 @@ export class AdtData {
                 this.indexBuffer.buffer,
             ),
         };
+        const lowDetailIndexBuffer = {
+            buffer: createBufferFromData(
+                device,
+                GfxBufferUsage.Index,
+                GfxBufferFrequencyHint.Static,
+                this.lowDetailIndexBuffer.buffer,
+            ),
+        };
+        const ultraDetailIndexBuffer = {
+            buffer: createBufferFromData(
+                device,
+                GfxBufferUsage.Index,
+                GfxBufferFrequencyHint.Static,
+                this.ultraDetailIndexBuffer.buffer,
+            ),
+        };
+        const extremeDetailIndexBuffer = {
+            buffer: createBufferFromData(
+                device,
+                GfxBufferUsage.Index,
+                GfxBufferFrequencyHint.Static,
+                this.extremeDetailIndexBuffer.buffer,
+            ),
+        };
         device.setResourceName(vertexBuffer.buffer, `Terrain`);
         device.setResourceName(indexBuffer.buffer, `Terrain (IB)`);
-        return [vertexBuffer, indexBuffer];
+        device.setResourceName(lowDetailIndexBuffer.buffer, `Terrain low detail (IB)`);
+        device.setResourceName(ultraDetailIndexBuffer.buffer, `Terrain ultra detail (IB)`);
+        device.setResourceName(extremeDetailIndexBuffer.buffer, `Terrain extreme detail (IB)`);
+        return [vertexBuffer, indexBuffer, lowDetailIndexBuffer, ultraDetailIndexBuffer, extremeDetailIndexBuffer];
     }
 
     public setupWmoCandidates(worldCamera: vec3, worldFrustum: Frustum) {
@@ -1753,6 +1910,12 @@ export class ChunkData {
     public shadowTexture: Uint8Array | undefined;
     public indexCount: number;
     public indexOffset: number;
+    public lowDetailIndexCount = 0;
+    public lowDetailIndexOffset = 0;
+    public ultraDetailIndexCount = 0;
+    public ultraDetailIndexOffset = 0;
+    public extremeDetailIndexCount = 0;
+    public extremeDetailIndexOffset = 0;
     public visible = true;
 
     constructor(
@@ -1877,21 +2040,15 @@ async function fetchAdt(
     fileIDs: WowMapFileDataIDsLike,
     lightdbMapId: number,
 ): Promise<AdtData> {
-    const [rootFile, obj0File, obj1File, texFile] = await Promise.all([
+    const [rootFile, texFile] = await Promise.all([
         cache.fetchDataByFileID(fileIDs.root_adt),
-        cache.fetchDataByFileID(fileIDs.obj0_adt),
-        fileIDs.obj1_adt !== 0
-            ? cache.fetchDataByFileID(fileIDs.obj1_adt)
-            : Promise.resolve(null!),
         cache.fetchDataByFileID(fileIDs.tex0_adt),
     ]);
 
     const wowAdt = rust.WowAdt.new(rootFile);
-    wowAdt.append_obj_adt(obj0File);
-    if (obj1File !== null) wowAdt.append_lod_obj_adt(obj1File);
     wowAdt.append_tex_adt(texFile);
 
-    return new AdtData(fileIDs.root_adt, wowAdt, lightdbMapId);
+    return new AdtData(fileIDs.root_adt, wowAdt, lightdbMapId, fileIDs);
 }
 
 export type AdtCoord = [number, number];
@@ -1899,14 +2056,16 @@ export type AdtCoord = [number, number];
 export class LazyWorldData {
     public adts: AdtData[] = [];
     public skyboxes: SkyboxData[] = [];
-    private loadedAdtCoords: AdtCoord[] = [];
+    private loadedAdts = new Map<string, AdtData>();
+    private loadingAdtCoords = new Set<string>();
+    private residentCenter: AdtCoord;
     public globalWmo: WmoData | null = null;
     public globalWmoDef: WmoDefinition | null = null;
     public hasBigAlpha: boolean;
     public hasHeightTexturing: boolean;
     public adtFileIds: WowMapFileDataIDs[] = [];
     public initialAdtRadius = 1; // how many ADTs to load around the start point before showing the scene
-    public adtRadius = 2; // how many ADTs to stream around the user as they fly around
+    public adtRadius = 4; // how many ADTs to stream around the user as they fly around
     public loading = false;
 
     constructor(
@@ -1914,7 +2073,9 @@ export class LazyWorldData {
         public startAdtCoords: AdtCoord,
         public cache: WowCache,
         public lightdbMapId: number,
-    ) {}
+    ) {
+        this.residentCenter = startAdtCoords;
+    }
 
     public async load() {
         const wdt = await this.cache.fetchFileByID(
@@ -1958,10 +2119,10 @@ export class LazyWorldData {
     public onEnterAdt(
         [centerX, centerY]: AdtCoord,
         callback: (coord: AdtCoord, adt: AdtData | undefined) => void,
+        unloadCallback: (coord: AdtCoord, adt: AdtData) => void,
     ): AdtCoord[] {
-        if (this.loading) {
-            return [];
-        }
+        this.residentCenter = [centerX, centerY];
+        this.unloadAdtsOutsideRadius(unloadCallback);
         let adtCoords: AdtCoord[] = [];
         console.log(`loading area around ${centerX}, ${centerY}`);
         for (
@@ -1974,43 +2135,101 @@ export class LazyWorldData {
                 y <= centerY + this.adtRadius;
                 y++
             ) {
-                if (!this.hasLoadedAdt([x, y])) {
+                if (!this.hasLoadedAdt([x, y]) && !this.loadingAdtCoords.has(`${x},${y}`)) {
                     adtCoords.push([x, y]);
+                    this.loadingAdtCoords.add(`${x},${y}`);
                 }
             }
         }
+        adtCoords.sort((a, b) => {
+            const distanceA = (a[0] - centerX) ** 2 + (a[1] - centerY) ** 2;
+            const distanceB = (b[0] - centerX) ** 2 + (b[1] - centerY) ** 2;
+            return distanceA - distanceB;
+        });
         setTimeout(async () => {
             this.loading = true;
-            for (let [x, y] of adtCoords) {
-                let maybeAdt: AdtData | undefined;
-                try {
-                    maybeAdt = await this.ensureAdtLoaded(x, y);
-                    if (maybeAdt) {
-                        this.adts.push(maybeAdt);
+            try {
+                for (let [x, y] of adtCoords) {
+                    const coord: AdtCoord = [x, y];
+                    let maybeAdt: AdtData | undefined;
+                    try {
+                        // A newer camera position can make an older batch obsolete.
+                        // Skip it before doing any disk, parsing or GPU work.
+                        if (this.isInsideResidentRadius(coord)) {
+                            maybeAdt = await this.ensureAdtLoaded(x, y);
+                            if (maybeAdt) {
+                                if (this.isInsideResidentRadius(coord)) {
+                                    this.adts.push(maybeAdt);
+                                } else {
+                                    // The camera moved while this ADT was loading.
+                                    this.loadedAdts.delete(`${x},${y}`);
+                                    maybeAdt = undefined;
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.error(`failed to load ADT ${x},${y}:`, e);
                     }
-                } catch (e) {
-                    console.log("failed to load ADT: ", e);
+
+                    try {
+                        callback(coord, maybeAdt);
+                    } catch (e) {
+                        console.error(`failed to set up ADT ${x},${y}:`, e);
+                        if (maybeAdt) {
+                            this.loadedAdts.delete(`${x},${y}`);
+                            const index = this.adts.indexOf(maybeAdt);
+                            if (index >= 0)
+                                this.adts.splice(index, 1);
+                            try {
+                                unloadCallback(coord, maybeAdt);
+                            } catch (unloadError) {
+                                console.error(`failed to clean up ADT ${x},${y}:`, unloadError);
+                            }
+                        }
+                    } finally {
+                        this.loadingAdtCoords.delete(`${x},${y}`);
+                    }
                 }
-                callback([x, y], maybeAdt);
+            } finally {
+                // Never leave coordinates permanently stuck in the loading set.
+                for (const [x, y] of adtCoords)
+                    this.loadingAdtCoords.delete(`${x},${y}`);
+                this.loading = this.loadingAdtCoords.size > 0;
             }
-            this.loading = false;
         }, 0);
         return adtCoords;
     }
 
     public hasLoadedAdt(coord: AdtCoord): boolean {
-        for (let [x, y] of this.loadedAdtCoords) {
-            if (x === coord[0] && y === coord[1]) {
-                return true;
-            }
+        return this.loadedAdts.has(`${coord[0]},${coord[1]}`);
+    }
+
+    private isInsideResidentRadius([x, y]: AdtCoord): boolean {
+        return Math.abs(x - this.residentCenter[0]) <= this.adtRadius &&
+            Math.abs(y - this.residentCenter[1]) <= this.adtRadius;
+    }
+
+    private unloadAdtsOutsideRadius(callback: (coord: AdtCoord, adt: AdtData) => void): void {
+        for (const [key, adt] of Array.from(this.loadedAdts.entries())) {
+            const [x, y] = key.split(',').map(Number) as AdtCoord;
+            if (this.isInsideResidentRadius([x, y]))
+                continue;
+
+            this.loadedAdts.delete(key);
+            const index = this.adts.indexOf(adt);
+            if (index >= 0)
+                this.adts.splice(index, 1);
+            callback([x, y], adt);
         }
-        return false;
     }
 
     public async ensureAdtLoaded(
         x: number,
         y: number,
     ): Promise<AdtData | undefined> {
+        if (x < 0 || x >= 64 || y < 0 || y >= 64) {
+            return undefined;
+        }
         if (this.hasLoadedAdt([x, y])) {
             return undefined;
         }
@@ -2039,7 +2258,7 @@ export class LazyWorldData {
         adt.hasBigAlpha = this.hasBigAlpha;
         adt.hasHeightTexturing = this.hasHeightTexturing;
         await adt.load(this.cache);
-        this.loadedAdtCoords.push([x, y]);
+        this.loadedAdts.set(`${x},${y}`, adt);
         return adt;
     }
 
@@ -2096,6 +2315,8 @@ export class WorldData {
                 adt.hasBigAlpha = hasBigAlpha;
                 adt.hasHeightTexturing = hasHeightTexturing;
                 await adt.load(cache);
+                await adt.loadLod(cache, 1);
+                await adt.loadLod(cache, 0);
                 this.adts.push(adt);
             }
         }

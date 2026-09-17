@@ -1,7 +1,7 @@
 
 // New UI system
 
-import { GIT_SHORT_REVISION, GITHUB_REVISION_URL, GITHUB_URL, IS_DEVELOPMENT } from './BuildVersion.js';
+import { GIT_SHORT_REVISION, GITHUB_URL, IS_DEVELOPMENT } from './BuildVersion.js';
 import { Camera, CameraController, CameraControllerClass, FPSCameraController, OrbitCameraController, OrthoCameraController } from './Camera.js';
 import { Color, colorToCSS } from './Color.js';
 import { DebugFloaterHolder } from './DebugFloaters.js';
@@ -16,7 +16,6 @@ import { assert, assertExists } from './util.js';
 import * as Viewer from './viewer.js';
 
 // @ts-ignore
-import logoURL from './assets/logo.png';
 import { AntialiasingMode } from './gfx/helpers/RenderGraphHelpers.js';
 import { TextureCanvas } from './TextureViewer.js';
 
@@ -1825,6 +1824,11 @@ export class TimeOfDayPanel extends Panel {
     public setTime(time: number): void {
         this.slider.setValue(time);
     }
+
+    public setDynamicTime(useDynamicTime: boolean): void {
+        this.useDynamicTime = useDynamicTime;
+        this.dynamicTimeCheckbox.setChecked(useDynamicTime);
+    }
 }
 
 export class RadioButtons implements Widget {
@@ -2261,7 +2265,7 @@ class StudioSidePanel extends Panel {
 class About extends Panel {
     constructor() {
         super();
-        this.setTitle(ABOUT_ICON, 'About');
+        this.setTitle(ABOUT_ICON, 'Info');
 
         this.contents.innerHTML = `
 <div id="About">
@@ -2283,28 +2287,28 @@ class About extends Panel {
 #About h2 {
     font-size: 12.8pt;
 }
-#About h1 span, #About h1 img {
-    vertical-align: middle;
-    line-height: 64px;
-}
-#About .BuildVersion a {
+#About .BuildVersion {
     color: #666;
     font-size: smaller;
 }
 </style>
 
-<h1> <img src="${logoURL}"> <span> noclip.website </span> </h1>
-<h2> A digital museum of video game levels </h2>
+<h1>World of Warcraft Maps and World 3D Explorer</h1>
+<h2>Esplorazione libera del mondo di World of Warcraft</h2>
 
-<p> <strong>CLICK AND DRAG</strong> to look around and use <strong>WASD</strong> to move the camera </p>
-<p> Hold <strong>SHIFT</strong> to go faster, and use <strong>MOUSE WHEEL</strong> to fine tune the speed
-<strong>Z</strong> toggles the UI. </p>
+<p>Fork apposita di <a href="https://noclip.website/">noclip.website</a> per l'esplorazione
+di World of Warcraft, con grandi ottimizzazioni per streaming, cache su disco, LOD,
+distanza visiva e panorami continentali.</p>
 
-<p><a href="https://discord.gg/bkJmKKv"><strong>JOIN THE DISCORD</strong> by clicking here</a></p>
+<p><strong>COMANDI:</strong> trascina il mouse per guardarti intorno e usa <strong>WASD</strong>
+per muovere la camera. Tieni premuto <strong>SHIFT</strong> per accelerare e usa la
+<strong>ROTELLA DEL MOUSE</strong> per regolare con precisione la velocita.
+<strong>Z</strong> mostra o nasconde l'interfaccia.</p>
 
-<p><strong>OPEN SOURCE</strong> at <a href="${GITHUB_URL}">GitHub</a></p>
+<p>Basato sul progetto open source originale disponibile su
+<a href="${GITHUB_URL}">GitHub</a>.</p>
 
-<p class="BuildVersion"><a href="${GITHUB_REVISION_URL}">build ${GIT_SHORT_REVISION}</a></p>
+<p class="BuildVersion">build ${GIT_SHORT_REVISION}</p>
 </div>
 `;
     }
