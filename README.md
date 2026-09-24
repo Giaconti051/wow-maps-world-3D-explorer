@@ -2,21 +2,23 @@
 
 A specialized fork of [noclip.website](https://github.com/magcius/noclip.website) for freely exploring World of Warcraft maps, including unfinished and normally inaccessible areas.
 
-The map selector focuses on Vanilla, The Burning Crusade and Wrath of the Lich King. This fork adds configurable terrain detail, streaming controls, persistent caching and resolution scaling for large landscape views.
+The map selector includes Vanilla, The Burning Crusade, Wrath of the Lich King, and an experimental WoW Forever beta. This fork adds configurable terrain detail, streaming controls, persistent caching and resolution scaling for large landscape views.
 
 ## Download and run on Windows
 
-Prebuilt packages are distributed through [Releases](https://github.com/Giaconti051/wow-maps-world-3D-explorer/releases). If no release is listed yet, a prebuilt download has not been published.
+Download the [Forever Beta 4 ZIP](releases/World_of_Warcraft_Maps_and_World_3D_Explorer_Forever_Beta4_Cache_Optimization.zip). The checked-in source is the earlier Vanilla/TBC/WotLK viewer; the Forever beta is currently provided as a separate prebuilt package. The Python server, downloader probe, and CDN manifests used by the Forever package are available in [`tools/wow-forever/`](tools/wow-forever/). The Forever renderer changes have not yet been fully ported back to the TypeScript/Rust source tree.
 
-1. Download the viewer ZIP attached to a release (not GitHub's automatically generated source archive).
+1. Download the Forever Beta 4 ZIP above (not GitHub's automatically generated source archive).
 2. Extract it into a folder on the drive of your choice.
-3. Run `START_WOW_ARCHAEOLOGY.bat` (the launcher retains its original filename).
+3. Run `START_WOW_FOREVER_EXPLORER.bat`. Python 3 and Microsoft Edge are required.
 4. Microsoft Edge opens the viewer at `http://localhost:4173/`.
 5. Keep the PowerShell window open while using the viewer. Press Ctrl+C there to stop the server.
 
 An internet connection is needed to fetch map resources that are not already cached. Game assets are not bundled in this update; resource availability depends on the external data service used by noclip.website.
 
-The launcher creates a dedicated Edge profile in `WoW_Archaeology_BrowserData`, next to `start.ps1`. Keep that directory when updating to retain cached downloads and preferences. Its old name is intentional for compatibility. Cached resources still need parsing and GPU upload when loaded again; caching does not make loading instantaneous or guarantee that an entire map is available offline.
+The launcher creates a dedicated Edge profile in `WoW_Archaeology_BrowserData` and a verified Forever CDN cache in `WoW_Forever_CDN_Cache`, next to the program. Keep both directories when updating. These directories are not included in the downloadable package or tracked in Git. Cached resources still need parsing and GPU upload when loaded again; caching does not make loading instantaneous or guarantee that an entire map is available offline.
+
+The experimental Forever beta includes terrain and water for Zephras Isle, Eastern Kingdoms and Kalimdor. It enables M2/WMO objects on the continental maps, and attempts to show shared indexed models on Zephras tile (28,26). Other Zephras objects and assets missing from the pinned CDN manifests remain unavailable. The CDN dataset is pinned to `wow_classic_beta 1.60.1.69893`.
 
 ## Features
 
@@ -41,7 +43,7 @@ See [the Italian guide](public/README_ITA.txt) for detailed settings and [the up
 
 The source repository is not a ready-to-run Windows package. You need Node.js, pnpm and Rust installed through rustup, as described in the upstream guide.
 
-From the repository root:
+From the repository root, to build the earlier Vanilla/TBC/WotLK viewer:
 
 ```sh
 pnpm install
@@ -53,7 +55,7 @@ cd ..
 pnpm build
 ```
 
-The output is in `dist/`; its launcher files are copied from `public/`. For development with optimized Rust, use `pnpm start:release`.
+The output is in `dist/`; its launcher files are copied from `public/`. For development with optimized Rust, use `pnpm start:release`. This source build does **not** reproduce the prebuilt Forever Beta 4 ZIP yet.
 
 ## Credits and license
 

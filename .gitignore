@@ -61,6 +61,7 @@ dist/
 
 WoW_Archaeology_BrowserData/
 *.zip
+!releases/*.zip
 
 __pycache__/
 *.pyc
